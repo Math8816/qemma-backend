@@ -1,0 +1,36 @@
+{
+  "name": "qemma-backend",
+  "version": "1.0.0",
+  "description": "Qemma Backend — تعلم Backend من الصفر",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "hash-passwords": "node scripts/hash-passwords.js",
+    "cy:open": "cypress open",
+    "cy:run": "cypress run",
+    "cy:headless": "cypress run --headless"
+  },
+  "keywords": [
+    "backend",
+    "express",
+    "postgresql"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
+    "joi": "^18.2.9",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.4.0",
+    "nodemailer": "^10.0.15",
+    "pg": "^8.12.0",
+    "socket.io": "^4.8.4",
+    "socket.io-client": "^4.8.4"
+  }
+}
