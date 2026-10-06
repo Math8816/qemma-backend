@@ -107,7 +107,19 @@ app.get('/db-check', async (_req, res) => {
     const { rows } = await pool.query('SELECT NOW() AS now, current_database() AS db');
     res.json({ ok: true, database: rows[0].db, time: rows[0].now });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    // ─── سجّل الخطأ الكامل في Render Logs ───
+    console.error('❌ db-check error:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
+
+    // ─── أرجع التفاصيل للمتصفح ───
+    res.status(500).json({
+      ok: false,
+      error: err.message || 'no_message',
+      code: err.code || 'no_code',
+      detail: err.detail || 'no_detail',
+      hint: err.hint || 'no_hint',
+      severity: err.severity || 'no_severity',
+      name: err.name || 'no_name',
+    });
   }
 });
 
