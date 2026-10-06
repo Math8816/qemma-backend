@@ -49,7 +49,10 @@ const ALLOWED_ORIGINS = [
   'https://qemma-platform.com',
   'https://app.qemma-platform.com',
   'https://qemma-platform.web.app',
-];
+  'https://qc-services.vercel.app',
+  'https://qc-services-h7vkcv7f8-math8816.vercel.app',
+  process.env.FRONTEND_URL,
+].filter(Boolean);
 
 app.use(
   cors({
