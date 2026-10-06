@@ -12,6 +12,9 @@ const rlsPool = new Pool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   max:      10,
+  ssl: process.env.NODE_ENV === 'production'
+    ? { rejectUnauthorized: false }
+    : false,
 });
 
 /**
@@ -30,19 +33,31 @@ async function queryAsUser(user, sql, params = []) {
 
     // ─── ضبط دور authenticated ───
     await client.query('SET LOCAL role TO authenticated');
-    await client.query("SELECT set_config('request.jwt.claim.role', $1, true)", ['authenticated']);
+    await client.query(
+      "SELECT set_config('request.jwt.claim.role', $1, true)",
+      ['authenticated']
+    );
 
     // ─── ضبط هوية المستخدم ───
     if (user && user.sub) {
-      await client.query("SELECT set_config('request.jwt.claim.sub', $1, true)", [user.sub]);
+      await client.query(
+        "SELECT set_config('request.jwt.claim.sub', $1, true)",
+        [user.sub]
+      );
     }
 
     if (user && user.tenant_id) {
-      await client.query("SELECT set_config('request.jwt.claim.tenant_id', $1, true)", [user.tenant_id]);
+      await client.query(
+        "SELECT set_config('request.jwt.claim.tenant_id', $1, true)",
+        [user.tenant_id]
+      );
     }
 
     if (user && user.organization_id) {
-      await client.query("SELECT set_config('request.jwt.claim.organization_id', $1, true)", [user.organization_id]);
+      await client.query(
+        "SELECT set_config('request.jwt.claim.organization_id', $1, true)",
+        [user.organization_id]
+      );
     }
 
     // ─── تنفيذ الاستعلام ───
