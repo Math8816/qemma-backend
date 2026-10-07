@@ -4,6 +4,7 @@
 const logger = require('./src/utils/logger');
 const { initSentry, captureException, setUser } = require('./src/utils/sentry');
 const twoFactorRouter = require('./src/routes/twoFactor');
+const syncRouter = require('./src/routes/sync');
 
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');                                    // ← أضف
@@ -142,6 +143,7 @@ app.use('/auth/v1/signup', signupLimiter);
 app.use('/auth/v1/recover', recoveryLimiter);
 app.use('/auth/v1', authRouter);
 app.use('/auth/v1/2fa', twoFactorRouter);
+app.use('/api/sync', syncRouter);
 
 // ═══════════════════════════════════════════════
 //  API Routes (مع API Limiter أولاً)
