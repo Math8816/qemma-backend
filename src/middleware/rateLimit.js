@@ -5,44 +5,47 @@
 
 const rateLimit = require('express-rate-limit');
 
-const isDev = process.env.NODE_ENV !== 'production';
+// ─── إعدادات مشتركة ───
+const commonOptions = {
+  standardHeaders: true,
+  legacyHeaders: false,
+  // ⚠️ مهم: تجاوز allowlist في التطوير
+  skip: () => false, // لا تتجاهل أي طلب
+  validate: { trustProxy: false }, // لتفادي التحذيرات
+};
 
-// ─── Auth: 10 محاولات / 15 دقيقة (إنتاج)، 1000 (تطوير) ───
+// ─── Auth: 10 محاولات / 15 دقيقة ───
 const authLimiter = rateLimit({
+  ...commonOptions,
   windowMs: 15 * 60 * 1000,
-  max: isDev ? 1000 : 10,
-  skipSuccessfulRequests: isDev,   // ← في التطوير: تجاهل الناجحة
+  max: 10,
   message: {
     error: 'too_many_requests',
     error_description: 'Too many login attempts. Try again later.',
   },
-  standardHeaders: true,
-  legacyHeaders: false,
 });
 
-// ─── API عام: 100 طلب / دقيقة (إنتاج)، 5000 (تطوير) ───
+// ─── API عام: 100 طلب / دقيقة ───
 const apiLimiter = rateLimit({
+  ...commonOptions,
   windowMs: 60 * 1000,
-  max: isDev ? 5000 : 100,
+  max: 100,
   message: {
     ok: false,
     error: 'too_many_requests',
     error_description: 'Too many requests. Slow down.',
   },
-  standardHeaders: true,
-  legacyHeaders: false,
 });
 
-// ─── Signup: 5 / ساعة (إنتاج)، 100 (تطوير) ───
+// ─── Signup: 5 حسابات / ساعة ───
 const signupLimiter = rateLimit({
+  ...commonOptions,
   windowMs: 60 * 60 * 1000,
-  max: isDev ? 100 : 5,
+  max: 5,
   message: {
     error: 'too_many_requests',
     error_description: 'Too many signup attempts. Try again later.',
   },
-  standardHeaders: true,
-  legacyHeaders: false,
 });
 
 module.exports = { authLimiter, apiLimiter, signupLimiter };

@@ -1,42 +1,32 @@
 // ═══════════════════════════════════════════════
 //  src/utils/mailer.js
-//  إرسال البريد الإلكتروني
+//  إرسال البريد الإلكتروني عبر Resend
 // ═══════════════════════════════════════════════
 
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
-let transporter = null;
+let resend = null;
 
 // ─── Init ───
-function initMailer() {
-  if (transporter) return transporter;
-
-  // ─── في التطوير: نستخدم Ethereal (وهمي) ───
-  if (process.env.NODE_ENV !== 'production') {
-    console.log('📧 Mailer: Development mode (Ethereal)');
-    return null; // سنطبع الرابط في console بدلاً من الإرسال
+function initResend() {
+  if (resend) return resend;
+  if (!process.env.RESEND_API_KEY) {
+    console.warn('⚠️ RESEND_API_KEY not set. Email disabled.');
+    return null;
   }
-
-  // ─── في الإنتاج: SMTP حقيقي ───
-  transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: parseInt(process.env.SMTP_PORT || '587'),
-    secure: process.env.SMTP_SECURE === 'true',
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-  });
-
-  return transporter;
+  resend = new Resend(process.env.RESEND_API_KEY);
+  console.log('✅ Resend initialized');
+  return resend;
 }
 
 // ─── Send Email ───
 async function sendEmail({ to, subject, html, text }) {
-  // ─── في التطوير: نطبع في console ───
-  if (process.env.NODE_ENV !== 'production') {
+  const client = initResend();
+
+  // ─── في التطوير بدون مفتاح: اطبع في Console ───
+  if (!client) {
     console.log('\n═══════════════════════════════════');
-    console.log('📧 EMAIL (Development Mode)');
+    console.log('📧 EMAIL (Console Mode)');
     console.log('═══════════════════════════════════');
     console.log(`To: ${to}`);
     console.log(`Subject: ${subject}`);
@@ -45,19 +35,30 @@ async function sendEmail({ to, subject, html, text }) {
     return { ok: true, dev: true };
   }
 
-  // ─── الإنتاج ───
-  const t = initMailer();
-  if (!t) throw new Error('Mailer not initialized');
+  // ─── الإنتاج: Resend ───
+  try {
+    const fromEmail = process.env.EMAIL_FROM || 'onboarding@resend.dev';
+    const fromName = process.env.EMAIL_FROM_NAME || 'Qemma';
 
-  const info = await t.sendMail({
-    from: process.env.SMTP_FROM || 'noreply@qemma.com',
-    to,
-    subject,
-    html,
-    text,
-  });
+    const { data, error } = await client.emails.send({
+      from: `${fromName} <${fromEmail}>`,
+      to: [to],
+      subject,
+      html: html || `<p>${text || ''}</p>`,
+      text: text || '',
+    });
 
-  return { ok: true, messageId: info.messageId };
+    if (error) {
+      console.error('❌ Resend error:', error);
+      throw new Error(error.message);
+    }
+
+    console.log(`✅ Email sent to ${to} (ID: ${data.id})`);
+    return { ok: true, id: data.id };
+  } catch (err) {
+    console.error('❌ Email send error:', err.message);
+    throw err;
+  }
 }
 
-module.exports = { sendEmail, initMailer };
+module.exports = { sendEmail, initResend };

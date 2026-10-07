@@ -1,6 +1,10 @@
 // ═══════════════════════════════════════════════
 //  Imports
 // ═══════════════════════════════════════════════
+const logger = require('./src/utils/logger');
+const { initSentry, captureException, setUser } = require('./src/utils/sentry');
+const twoFactorRouter = require('./src/routes/twoFactor');
+
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');                                    // ← أضف
 const helmet = require('helmet');
@@ -21,6 +25,7 @@ const genericRouter = require('./src/routes/generic');
 const storageRouter = require('./src/routes/storage');
 
 const app = express();
+initSentry(app);
 const PORT = process.env.PORT || 4000;
 
 // ═══════════════════════════════════════════════
@@ -81,8 +86,11 @@ app.use(optionalAuth);
 // ═══════════════════════════════════════════════
 //  Logger
 // ═══════════════════════════════════════════════
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    logger.logRequest(req, res, Date.now() - start);
+  });
   next();
 });
 
@@ -133,6 +141,7 @@ app.use('/auth/v1/token', authLimiter);
 app.use('/auth/v1/signup', signupLimiter);
 app.use('/auth/v1/recover', recoveryLimiter);
 app.use('/auth/v1', authRouter);
+app.use('/auth/v1/2fa', twoFactorRouter);
 
 // ═══════════════════════════════════════════════
 //  API Routes (مع API Limiter أولاً)
@@ -173,15 +182,24 @@ app.get('/', (_req, res) => {
 // ═══════════════════════════════════════════════
 //  CORS Error Handler
 // ═══════════════════════════════════════════════
-app.use((err, _req, res, next) => {
+app.use((err, req, res, _next) => {
+  // ─── CORS ───
   if (err.message === 'Not allowed by CORS') {
-    return res.status(403).json({
-      ok: false,
-      error: 'CORS blocked',
-      error_description: 'Origin not allowed',
-    });
+    logger.warn(`CORS blocked: ${req.headers.origin}`);
+    return res.status(403).json({ ok: false, error: 'CORS blocked' });
   }
-  next(err);
+
+  // ─── Sentry + Logger ───
+  captureException(err, { url: req.url, method: req.method });
+  logger.logError(err, { url: req.url, method: req.method });
+
+  // ─── Response ───
+  const isDev = process.env.NODE_ENV !== 'production';
+  res.status(err.statusCode || 500).json({
+    ok: false,
+    error: 'Internal server error',
+    ...(isDev && { details: err.message }),
+  });
 });
 
 // ═══════════════════════════════════════════════

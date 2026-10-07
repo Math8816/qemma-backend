@@ -19,7 +19,7 @@ module.exports = defineConfig({
     },
     env: {
       TEST_EMAIL: 'admin@qemma.local',
-      TEST_PASSWORD: 'Fg_123',
+      TEST_PASSWORD: 'Admin123',
     },
     setupNodeEvents(on, config) {
       return config;
