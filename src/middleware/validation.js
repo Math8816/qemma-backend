@@ -11,6 +11,7 @@ const signupSchema = Joi.object({
   email: Joi.string().email({ tlds: { allow: false } }).required().max(255).lowercase().trim(),
   password: Joi.string().min(6).max(128).required(),
   full_name: Joi.string().max(255).optional().allow(null, ''),
+  invite_token: Joi.string().max(255).optional().allow(null, ''),
   role: Joi.string().valid('developer', 'owner', 'org_admin', 'store_admin', 'employee').optional(),
   tenant_id: Joi.string().uuid().optional().allow(null),
   organization_id: Joi.string().uuid().optional().allow(null),

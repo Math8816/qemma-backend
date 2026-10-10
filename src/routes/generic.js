@@ -57,9 +57,12 @@ const ALLOWED_TABLES = [
 
   // ─── نظام ───
   'notifications',
+  'admin_settings',
   'settings',
   'tenants',
   'organizations',
+  'users',
+  'trial_signups',
 ];
 
 // ─── حقول الفلترة المباشرة (للتوافق) ───

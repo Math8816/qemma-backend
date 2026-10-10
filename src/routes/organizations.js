@@ -188,14 +188,36 @@ router.post('/:id/branches', optionalAuth, async (req, res) => {
       return res.status(409).json({ ok: false, error: `الحد الأقصى ${org.max_branches} فروع` });
     }
 
-    const tenantRes = await client.query(
-      `INSERT INTO tenants (name, email, phone, address, organization_id, subscription_plan,
-         subscription_status, subscription_started_at, subscription_expires_at, is_active)
-       VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, true)
-       RETURNING *`,
-      [name.trim(), phone, address, req.params.id, org.plan,
-       org.subscription_status || 'active', org.subscription_started_at, org.subscription_expires_at]
-    );
+    // ═══════════════════════════════════════════════════════════
+//  🎯 خريطة تحويل: باقة السلسلة → باقة الفرع
+//  premium    → standard_plus
+//  enterprise → standard_plus
+// ═══════════════════════════════════════════════════════════
+const ORG_TO_STORE_PLAN = {
+  premium: 'standard_plus',
+  enterprise: 'standard_plus',
+};
+
+const storePlan = ORG_TO_STORE_PLAN[org.plan] || 'standard_plus';
+
+console.log(`🏢 Creating branch "${name.trim()}" — org plan: ${org.plan} → store plan: ${storePlan}`);
+
+const tenantRes = await client.query(
+  `INSERT INTO tenants (name, email, phone, address, organization_id, subscription_plan,
+     subscription_status, subscription_started_at, subscription_expires_at, is_active)
+   VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, true)
+   RETURNING *`,
+  [
+    name.trim(),
+    phone,
+    address,
+    req.params.id,
+    storePlan,                                       // ← هنا التحويل
+    org.subscription_status || 'active',
+    org.subscription_started_at,
+    org.subscription_expires_at,
+  ]
+);
     const tenant = tenantRes.rows[0];
 
     const isFirst = org.current_branches === 0;
@@ -416,6 +438,42 @@ router.post('/:id/unlink-owner', optionalAuth, async (req, res) => {
     await pool.query(`UPDATE organizations SET owner_id = NULL WHERE id = $1`, [req.params.id]);
     res.json({ ok: true, success: true });
   } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  GET /api/organizations — قائمة كل السلاسل (Developer)
+// ═══════════════════════════════════════════════════════════
+router.get('/', optionalAuth, async (req, res) => {
+  try {
+    const check = requireRole(req.user, ['developer', 'dev_assistant', 'support', 'auditor']);
+    if (!check.ok) return res.status(check.code).json({ ok: false, error: check.error });
+
+    const { rows } = await pool.query(`
+      SELECT
+        o.id,
+        o.name,
+        o.plan,
+        o.max_branches,
+        o.current_branches,
+        o.owner_id,
+        o.is_active,
+        o.subscription_status,
+        o.subscription_started_at,
+        o.subscription_expires_at,
+        o.created_at,
+        o.updated_at,
+        u.full_name AS owner_name,
+        u.email AS owner_email
+      FROM organizations o
+      LEFT JOIN users u ON u.id = o.owner_id
+      ORDER BY o.created_at DESC
+    `);
+
+    res.json({ ok: true, count: rows.length, data: rows });
+  } catch (err) {
+    console.error('GET /organizations error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
