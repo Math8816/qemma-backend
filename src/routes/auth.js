@@ -138,7 +138,7 @@ router.post('/token', validate(loginSchema), async (req, res) => {
       access_token: accessToken,
       token_type: 'bearer',
       expires_in: 3600,
-      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      expires_at: new Date(Date.now() + 3600 * 1000).toISOString(),
       refresh_token: refreshToken,
       user: {
         id: user.id,
@@ -278,7 +278,7 @@ router.post('/signup', validate(signupSchema), async (req, res) => {
       access_token: accessToken,
       token_type: 'bearer',
       expires_in: 3600,
-      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      expires_at: new Date(Date.now() + 3600 * 1000).toISOString(),
       refresh_token: refreshToken,
       user: {
         id: user.id,
@@ -390,7 +390,7 @@ router.post('/token/refresh', async (req, res) => {
       access_token: accessToken,
       token_type: 'bearer',
       expires_in: 3600,
-      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      expires_at: new Date(Date.now() + 3600 * 1000).toISOString(),
       refresh_token: newRefreshToken,
       user: {
         id: record.uid,
@@ -815,7 +815,7 @@ router.post('/2fa/verify-login', async (req, res) => {
       access_token: accessToken,
       token_type: 'bearer',
       expires_in: 3600,
-      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      expires_at: new Date(Date.now() + 3600 * 1000).toISOString(),
       refresh_token: refreshToken,
       user: {
         id: user.id,

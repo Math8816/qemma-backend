@@ -1,12 +1,12 @@
 // ═══════════════════════════════════════════════
 //  src/routes/products.js
-//  CRUD كامل مع RLS + Audit
+//  CRUD كامل مع RLS + Audit + Joins
 // ═══════════════════════════════════════════════
 
 const express = require('express');
 const pool = require('../db');
 const { queryAsUser } = require('../db-rls');
-const { optionalAuth } = require('../middleware/auth');
+const { optionalAuth, requireAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
 
 const router = express.Router();
@@ -15,7 +15,7 @@ const router = express.Router();
 router.use(auditMiddleware);
 
 // ═══════════════════════════════════════════════
-//  GET /api/products — كل المنتجات (بدون RLS)
+//  GET /api/products — كل المنتجات (بدون RLS) — للاختبار
 // ═══════════════════════════════════════════════
 router.get('/', async (_req, res) => {
   try {
@@ -30,7 +30,9 @@ router.get('/', async (_req, res) => {
 });
 
 // ═══════════════════════════════════════════════
-//  GET /api/products/rls/list — كل المنتجات (مع RLS)
+//  GET /api/products/rls/list — قائمة كاملة (مع RLS + Joins)
+//  ✅ يجلب: التصنيف + الشركة + الوحدات + الأسعار
+//  ⚠️ يجب أن يكون قبل /:id
 // ═══════════════════════════════════════════════
 router.get('/rls/list', optionalAuth, async (req, res) => {
   try {
@@ -38,17 +40,77 @@ router.get('/rls/list', optionalAuth, async (req, res) => {
 
     const result = await queryAsUser(
       user,
-      `SELECT id, name, tenant_id, organization_id, created_at
-       FROM products
-       ORDER BY name
-       LIMIT 100`
+      `SELECT 
+         p.id,
+         p.name,
+         p.category_id,
+         p.company_id,
+         p.tenant_id,
+         p.organization_id,
+         p.created_at,
+         p.updated_at,
+
+         -- التصنيف
+         c.name AS category_name,
+         c.color AS category_color,
+
+         -- الشركة
+         co.name AS company_name,
+
+         -- الوحدات (JSON array)
+         COALESCE(
+           (
+             SELECT json_agg(
+               json_build_object(
+                 'id', pu.id,
+                 'product_id', pu.product_id,
+                 'unit_id', pu.unit_id,
+                 'quantity', pu.quantity,
+                 'min_quantity', pu.min_quantity,
+                 'barcode', pu.barcode,
+                 'cost', pu.cost,
+                 'wholesale_price', pu.wholesale_price,
+                 'retail_price', pu.retail_price,
+                 'unit_name', u.name,
+                 'unit_symbol', u.symbol
+               )
+               ORDER BY pu.created_at
+             )
+             FROM product_units pu
+             LEFT JOIN units u ON u.id = pu.unit_id
+             WHERE pu.product_id = p.id
+           ),
+           '[]'::json
+         ) AS product_units
+
+       FROM products p
+       LEFT JOIN categories c ON c.id = p.category_id
+       LEFT JOIN companies co ON co.id = p.company_id
+       ORDER BY p.name
+       LIMIT 200`
     );
+
+    // ─── إضافة حقول مسطحة من أول وحدة (للتوافق مع Frontend القديم) ───
+    const enriched = result.rows.map((row) => {
+      const firstUnit = row.product_units?.[0] || {};
+      return {
+        ...row,
+        cost: firstUnit.cost || 0,
+        price: firstUnit.retail_price || 0,
+        retail_price: firstUnit.retail_price || 0,
+        wholesale_price: firstUnit.wholesale_price || 0,
+        quantity: firstUnit.quantity || 0,
+        min_quantity: firstUnit.min_quantity || 5,
+        barcode: firstUnit.barcode || null,
+        unit_id: firstUnit.unit_id || null,
+      };
+    });
 
     res.json({
       ok: true,
       user: user.sub || 'anonymous',
-      count: result.rows.length,
-      data: result.rows,
+      count: enriched.length,
+      data: enriched,
     });
   } catch (err) {
     console.error('GET /products/rls/list error:', err.message);
@@ -57,7 +119,64 @@ router.get('/rls/list', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════
+//  GET /api/products/rls/:id — منتج واحد مع العلاقات (مع RLS)
+// ═══════════════════════════════════════════════
+router.get('/rls/:id', optionalAuth, async (req, res) => {
+  try {
+    const user = req.user || { sub: null };
+
+    const result = await queryAsUser(
+      user,
+      `SELECT 
+         p.*,
+         c.name AS category_name,
+         c.color AS category_color,
+         co.name AS company_name,
+         COALESCE(
+           (
+             SELECT json_agg(
+               json_build_object(
+                 'id', pu.id,
+                 'product_id', pu.product_id,
+                 'unit_id', pu.unit_id,
+                 'quantity', pu.quantity,
+                 'min_quantity', pu.min_quantity,
+                 'barcode', pu.barcode,
+                 'cost', pu.cost,
+                 'wholesale_price', pu.wholesale_price,
+                 'retail_price', pu.retail_price,
+                 'unit_name', u.name,
+                 'unit_symbol', u.symbol
+               )
+               ORDER BY pu.created_at
+             )
+             FROM product_units pu
+             LEFT JOIN units u ON u.id = pu.unit_id
+             WHERE pu.product_id = p.id
+           ),
+           '[]'::json
+         ) AS product_units
+       FROM products p
+       LEFT JOIN categories c ON c.id = p.category_id
+       LEFT JOIN companies co ON co.id = p.company_id
+       WHERE p.id = $1`,
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Product not found or access denied' });
+    }
+
+    res.json({ ok: true, data: result.rows[0] });
+  } catch (err) {
+    console.error('GET /products/rls/:id error:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════
 //  GET /api/products/:id — منتج واحد (بدون RLS)
+//  ⚠️ يجب أن يكون بعد /rls/list و /rls/:id
 // ═══════════════════════════════════════════════
 router.get('/:id', async (req, res) => {
   try {
@@ -97,7 +216,6 @@ router.post('/', async (req, res) => {
       [name.trim(), category_id || null, company_id || null, tenant_id, organization_id || null]
     );
 
-    // ✅ Audit
     await req.audit({
       action: 'create',
       tableName: 'products',
@@ -128,7 +246,6 @@ router.post('/rls', optionalAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'name is required' });
     }
 
-    // tenant_id من JWT (لا من req.body — للأمان)
     const tenantId = user.tenant_id;
     const organizationId = user.organization_id || null;
 
@@ -144,7 +261,6 @@ router.post('/rls', optionalAuth, async (req, res) => {
       [name.trim(), category_id || null, company_id || null, tenantId, organizationId]
     );
 
-    // ✅ Audit
     await req.audit({
       action: 'create',
       tableName: 'products',
@@ -170,7 +286,6 @@ router.put('/:id', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'name is required' });
     }
 
-    // جلب البيانات القديمة (للـ Audit)
     const { rows: oldRows } = await pool.query(
       'SELECT * FROM products WHERE id = $1',
       [req.params.id]
@@ -188,7 +303,6 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Product not found' });
     }
 
-    // ✅ Audit
     await req.audit({
       action: 'update',
       tableName: 'products',
@@ -220,7 +334,6 @@ router.put('/rls/:id', optionalAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'name is required' });
     }
 
-    // جلب البيانات القديمة (مع RLS)
     const oldResult = await queryAsUser(
       user,
       'SELECT * FROM products WHERE id = $1',
@@ -240,7 +353,6 @@ router.put('/rls/:id', optionalAuth, async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Product not found or access denied' });
     }
 
-    // ✅ Audit
     await req.audit({
       action: 'update',
       tableName: 'products',
@@ -270,7 +382,6 @@ router.delete('/:id', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Product not found' });
     }
 
-    // ✅ Audit
     await req.audit({
       action: 'delete',
       tableName: 'products',
@@ -305,7 +416,6 @@ router.delete('/rls/:id', optionalAuth, async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Product not found or access denied' });
     }
 
-    // ✅ Audit
     await req.audit({
       action: 'delete',
       tableName: 'products',

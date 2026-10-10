@@ -18,7 +18,28 @@ const { initSocket } = require('./src/realtime/socket');
 const { optionalAuth } = require('./src/middleware/auth');
 const { authLimiter, apiLimiter, signupLimiter } = require('./src/middleware/rateLimit');
 
+const tenantsRouter = require('./src/routes/tenants');
+const notificationsRouter = require('./src/routes/notifications');
+
+const dashboardRouter = require('./src/routes/dashboard');
+const organizationsRouter = require('./src/routes/organizations');
 const productsRouter = require('./src/routes/products');
+const categoriesRouter = require('./src/routes/categories');
+const companiesRouter = require('./src/routes/companies');
+const unitsRouter = require('./src/routes/units');
+const customersRouter = require('./src/routes/customers');
+const suppliersRouter = require('./src/routes/suppliers');
+const salesRepsRouter = require('./src/routes/salesReps');
+const salesInvoicesRouter = require('./src/routes/salesInvoices');
+const purchaseInvoicesRouter = require('./src/routes/purchaseInvoices');
+const returnsRouter = require('./src/routes/returns');
+const periodsRouter = require('./src/routes/periods');
+const ledgerRouter = require('./src/routes/ledger');
+const ledgerReportsRouter = require('./src/routes/ledgerReports');
+const stockRouter = require('./src/routes/stock');
+const invitesRouter = require('./src/routes/invites');
+const trialsRouter = require('./src/routes/trials');
+const backupRouter = require('./src/routes/backup');
 const usersRouter = require('./src/routes/users');
 const authRouter = require('./src/routes/auth');
 const auditRouter = require('./src/routes/audit');
@@ -148,9 +169,29 @@ app.use('/api/sync', syncRouter);
 // ═══════════════════════════════════════════════
 //  API Routes (مع API Limiter أولاً)
 // ═══════════════════════════════════════════════
+app.use('/api/tenants', tenantsRouter);
+app.use('/api/notifications', notificationsRouter);
 app.use('/storage/v1', storageRouter);
 app.use('/api', apiLimiter);            // ← قبل كل /api/*
+app.use('/api/dashboard', dashboardRouter);
+app.use('/api/organizations', organizationsRouter);
 app.use('/api/products', productsRouter);
+app.use('/api/categories', categoriesRouter);
+app.use('/api/companies', companiesRouter);
+app.use('/api/units', unitsRouter);
+app.use('/api/customers', customersRouter);
+app.use('/api/suppliers', suppliersRouter);
+app.use('/api/sales-reps', salesRepsRouter);
+app.use('/api/returns', returnsRouter);
+app.use('/api/sales-invoices', salesInvoicesRouter);
+app.use('/api/purchase-invoices', purchaseInvoicesRouter);
+app.use('/api/periods', periodsRouter);
+app.use('/api/ledger', ledgerRouter);
+app.use('/api/ledger/reports', ledgerReportsRouter);
+app.use('/api/stock', stockRouter);
+app.use('/api/invites', invitesRouter);
+app.use('/api/trials', trialsRouter);
+app.use('/api/backup', backupRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/audit', auditRouter);
 app.use('/api/generic', genericRouter);
