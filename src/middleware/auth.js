@@ -13,7 +13,7 @@ function optionalAuth(req, _res, next) {
     } catch (err) {
       req.user = null;
     }
-  } else {0
+  } else {
     req.user = null;
   }
 

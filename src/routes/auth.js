@@ -285,86 +285,117 @@ router.post('/token', validate(loginSchema), async (req, res) => {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  2. محاولة trial_signups
-    // ═══════════════════════════════════════════════════════
-    const { rows: trialRows } = await pool.query(
-      `SELECT id, email, full_name, tenant_id, trial_ends_at, role
-       FROM trial_signups WHERE email = $1`,
-      [normalizedEmail]
+//  2. محاولة trial_signups
+// ═══════════════════════════════════════════════════════
+const { rows: trialRows } = await pool.query(
+  `SELECT id, email, full_name, tenant_id, trial_ends_at, role, password_hash
+   FROM trial_signups WHERE email = $1`,
+  [normalizedEmail]
+);
+
+if (trialRows.length > 0) {
+  const trial = trialRows[0];
+
+  // ═══ 2.1 فحص انتهاء التجربة ═══
+  const now = new Date();
+  const trialEnd = new Date(trial.trial_ends_at);
+
+  if (now >= trialEnd) {
+    return res.status(403).json({
+      error: 'trial_expired',
+      error_description: 'انتهت فترة التجربة. يرجى الترقية للاستمرار.',
+    });
+  }
+
+  // ═══ 2.2 فحص كلمة المرور ═══
+  if (!trial.password_hash) {
+    // حساب قديم بدون password_hash
+    return res.status(400).json({
+      error: 'invalid_grant',
+      error_description: 'حسابك التجريبي يحتاج تحديث. يرجى التواصل مع الدعم.',
+    });
+  }
+
+  const passwordOk = await bcrypt.compare(password, trial.password_hash);
+  if (!passwordOk) {
+    return res.status(400).json({
+      error: 'invalid_grant',
+      error_description: 'بيانات الدخول غير صحيحة',
+    });
+  }
+
+  // ═══ 2.3 بناء كائن user مؤقت للـ trial ═══
+  const trialUser = {
+    id: trial.id,
+    email: trial.email,
+    full_name: trial.full_name,
+    role: 'trial_store_admin',
+    tenant_id: trial.tenant_id,
+    organization_id: null,
+    is_active: true,
+    invite_status: 'accepted',
+  };
+
+  // ═══ 2.4 تسجيل آخر دخول ═══
+  await pool.query(
+    `UPDATE trial_signups SET updated_at = NOW() WHERE id = $1`,
+    [trial.id]
+  );
+
+  // ═══ 2.5 إصدار access_token ═══
+  const accessToken = jwt.sign(
+    {
+      sub: trial.id,
+      email: trial.email,
+      role: 'trial_store_admin',
+      tenant_id: trial.tenant_id,
+      organization_id: null,
+    },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
+
+  // ═══ 2.6 context للـ trial ═══
+  let trialContext = {
+    plan: 'trial',
+    subscription_status: 'active',
+    subscription_expires_at: trial.trial_ends_at,
+    context_type: 'tenant',
+    hq_tenant_id: null,
+    organization: null,
+    tenant: null,
+  };
+
+  if (trial.tenant_id) {
+    const { rows: tRows } = await pool.query(
+      `SELECT id, name, is_active FROM tenants WHERE id = $1`,
+      [trial.tenant_id]
     );
-
-    if (trialRows.length > 0) {
-      const trial = trialRows[0];
-
-      const now = new Date();
-      const trialEnd = new Date(trial.trial_ends_at);
-
-      if (now >= trialEnd) {
-        return res.status(403).json({
-          error: 'trial_expired',
-          error_description: 'Your trial period has expired.',
-        });
-      }
-
-      // ─── بناء كائن user مؤقت للـ trial ───
-      const trialUser = {
-        id: trial.id,
-        email: trial.email,
-        full_name: trial.full_name,
-        role: 'trial_store_admin',
-        tenant_id: trial.tenant_id,
-        organization_id: null,
-        is_active: true,
-        invite_status: 'accepted',
+    if (tRows.length > 0) {
+      trialContext.tenant = {
+        id: tRows[0].id,
+        name: tRows[0].name,
+        is_active: tRows[0].is_active,
       };
-
-      const accessToken = jwt.sign(
-        {
-          sub: trial.id,
-          email: trial.email,
-          role: 'trial_store_admin',
-          tenant_id: trial.tenant_id,
-          organization_id: null,
-        },
-        JWT_SECRET,
-        { expiresIn: JWT_EXPIRES_IN }
-      );
-
-      // ─── context للـ trial ───
-      let trialContext = {
-        plan: 'trial',
-        subscription_status: 'active',
-        subscription_expires_at: trial.trial_ends_at,
-        context_type: 'tenant',
-        hq_tenant_id: null,
-        organization: null,
-        tenant: null,
-      };
-
-      if (trial.tenant_id) {
-        const { rows: tRows } = await pool.query(
-          `SELECT id, name, is_active FROM tenants WHERE id = $1`,
-          [trial.tenant_id]
-        );
-        if (tRows.length > 0) {
-          trialContext.tenant = {
-            id: tRows[0].id,
-            name: tRows[0].name,
-            is_active: tRows[0].is_active,
-          };
-        }
-      }
-
-      return res.json({
-        access_token: accessToken,
-        token_type: 'bearer',
-        expires_in: 3600,
-        expires_at: new Date(Date.now() + 3600 * 1000).toISOString(),
-        refresh_token: null,
-        user: buildUserObject(trialUser),
-        context: trialContext,
-      });
     }
+  }
+
+  // ═══ 2.7 رد بدون 2FA (trial لا يدعم 2FA) ═══
+  return res.json({
+    access_token: accessToken,
+    token_type: 'bearer',
+    expires_in: 3600,
+    expires_at: new Date(Date.now() + 3600 * 1000).toISOString(),
+    refresh_token: null,
+    user: buildUserObject(trialUser),
+    context: trialContext,
+    is_trial: true,
+    trial: {
+      starts_at: trial.trial_started_at || null,
+      ends_at: trial.trial_ends_at,
+    },
+  });
+}
 
     // ═══════════════════════════════════════════════════════
     //  3. ❌ لم يُعثر على المستخدم
@@ -946,21 +977,32 @@ router.post('/trial-signup', async (req, res) => {
     );
     const tenant = tenantRows[0];
 
-    // ─── 3. إنشاء trial_signups ───
+    // ⭐⭐⭐ 3. تشفير كلمة المرور ⭐⭐⭐
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // ─── 4. إنشاء trial_signups (مع password_hash) ───
     const trialId = crypto.randomUUID();
 
     await client.query(
       `INSERT INTO trial_signups
         (id, email, full_name, phone, tenant_id, tenant_name,
-         trial_started_at, trial_ends_at, role, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, 'trial_store_admin', true)`,
-      [trialId, normalizedEmail, full_name.trim(), phone || null,
-       tenant.id, tenant.name, trialEndsAt]
+         trial_started_at, trial_ends_at, role, is_active, password_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, 'trial_store_admin', true, $8)`,
+      [
+        trialId,
+        normalizedEmail,
+        full_name.trim(),
+        phone || null,
+        tenant.id,
+        tenant.name,
+        trialEndsAt,
+        passwordHash,        // ← ⭐ جديد
+      ]
     );
 
     await client.query('COMMIT');
 
-    // ─── 4. تسجيل دخول تلقائي ───
+    // ─── 5. تسجيل دخول تلقائي ───
     const trialUser = {
       id: trialId,
       email: normalizedEmail,
@@ -1000,6 +1042,7 @@ router.post('/trial-signup', async (req, res) => {
         organization: null,
         tenant: { id: tenant.id, name: tenant.name, is_active: true },
       },
+      is_trial: true,
       trial: {
         starts_at: new Date().toISOString(),
         ends_at: trialEndsAt,

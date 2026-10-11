@@ -1,0 +1,11 @@
+{
+  "organizationId": "e2d2d81a-4f44-4ff5-9ea4-64d1555054f6",
+  "tenantId": "6b80e891-d813-4778-ba5e-a96d0e9501c7",
+  "branchId": "9d7b7f1b-f0b2-4719-bc00-539217aadeba",
+  "accounts": [
+    "owner@qemma.com",
+    "org_admin@qemma.com",
+    "store_admin@qemma.com",
+    "employee@qemma.com"
+  ]
+}

@@ -96,7 +96,7 @@ function parseFilters(query) {
   const where = [];
   const params = [];
 
-  // 1. الفلاتر المباشرة
+  // 1. الفلاتر المباشرة (tenant_id, organization_id, ...)
   DIRECT_FILTERS.forEach((f) => {
     if (query[f]) {
       params.push(query[f]);
@@ -104,74 +104,77 @@ function parseFilters(query) {
     }
   });
 
-  // 2. صيغة filter[i][op] (من QueryBuilder)
-  const groups = {};
-  Object.keys(query).forEach((k) => {
-    const m = k.match(/^filter\[(\d+)\]\[(.+)\]$/);
-    if (m) {
-      if (!groups[m[1]]) groups[m[1]] = {};
-      groups[m[1]][m[2]] = query[k];
-    }
-  });
+  // 2. صيغة filter[i][op/col/val] — Express يفكّها ككائنات متداخلة
+  const filterObj = query.filter;
+  if (filterObj && typeof filterObj === 'object') {
+    Object.keys(filterObj).forEach((idx) => {
+      const group = filterObj[idx];
+      if (!group || typeof group !== 'object') return;
 
-  Object.values(groups).forEach((g) => {
-    const { op, col, val } = g;
-    if (!col || !ALLOWED_FILTER_COLS.has(col)) return;
+      const { op, col, val } = group;
+      if (!col || !ALLOWED_FILTER_COLS.has(col)) return;
 
-    let parsed = val;
-    try { parsed = JSON.parse(val); } catch { /* keep string */ }
+      let parsed = val;
+      try { parsed = JSON.parse(val); } catch { /* keep string */ }
 
-    switch (op) {
-      case 'eq':
-        params.push(parsed);
-        where.push(`${col} = $${params.length}`);
-        break;
-      case 'neq':
-        params.push(parsed);
-        where.push(`${col} != $${params.length}`);
-        break;
-      case 'gt':
-        params.push(parsed);
-        where.push(`${col} > $${params.length}`);
-        break;
-      case 'gte':
-        params.push(parsed);
-        where.push(`${col} >= $${params.length}`);
-        break;
-      case 'lt':
-        params.push(parsed);
-        where.push(`${col} < $${params.length}`);
-        break;
-      case 'lte':
-        params.push(parsed);
-        where.push(`${col} <= $${params.length}`);
-        break;
-      case 'in':
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const ph = parsed.map((v) => { params.push(v); return `$${params.length}`; });
-          where.push(`${col} IN (${ph.join(',')})`);
-        }
-        break;
-      case 'is':
-        if (parsed === null) where.push(`${col} IS NULL`);
-        else if (parsed === true) where.push(`${col} = true`);
-        else if (parsed === false) where.push(`${col} = false`);
-        break;
-      case 'not.eq':
-        params.push(parsed);
-        where.push(`${col} != $${params.length}`);
-        break;
-      case 'not.in':
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const ph = parsed.map((v) => { params.push(v); return `$${params.length}`; });
-          where.push(`${col} NOT IN (${ph.join(',')})`);
-        }
-        break;
-      case 'not.is':
-        if (parsed === null) where.push(`${col} IS NOT NULL`);
-        break;
-    }
-  });
+      switch (op) {
+        case 'eq':
+          params.push(parsed);
+          where.push(`${col} = $${params.length}`);
+          break;
+        case 'neq':
+          params.push(parsed);
+          where.push(`${col} != $${params.length}`);
+          break;
+        case 'gt':
+          params.push(parsed);
+          where.push(`${col} > $${params.length}`);
+          break;
+        case 'gte':
+          params.push(parsed);
+          where.push(`${col} >= $${params.length}`);
+          break;
+        case 'lt':
+          params.push(parsed);
+          where.push(`${col} < $${params.length}`);
+          break;
+        case 'lte':
+          params.push(parsed);
+          where.push(`${col} <= $${params.length}`);
+          break;
+        case 'in':
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const ph = parsed.map((v) => {
+              params.push(v);
+              return `$${params.length}`;
+            });
+            where.push(`${col} IN (${ph.join(',')})`);
+          }
+          break;
+        case 'is':
+          if (parsed === null) where.push(`${col} IS NULL`);
+          else if (parsed === true) where.push(`${col} = true`);
+          else if (parsed === false) where.push(`${col} = false`);
+          break;
+        case 'not.eq':
+          params.push(parsed);
+          where.push(`${col} != $${params.length}`);
+          break;
+        case 'not.in':
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const ph = parsed.map((v) => {
+              params.push(v);
+              return `$${params.length}`;
+            });
+            where.push(`${col} NOT IN (${ph.join(',')})`);
+          }
+          break;
+        case 'not.is':
+          if (parsed === null) where.push(`${col} IS NOT NULL`);
+          break;
+      }
+    });
+  }
 
   return { where, params };
 }
