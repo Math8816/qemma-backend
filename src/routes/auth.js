@@ -915,30 +915,40 @@ router.post('/signup', validate(signupSchema), async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════
 //  POST /auth/v1/trial-signup — تسجيل تجريبي 7 أيام
+//  ✅ بدون كلمة مرور من المستخدم (Trial123! ثابتة)
+//  ✅ لا JWT — المستخدم يذهب لـ /login
 // ═══════════════════════════════════════════════════════════
 router.post('/trial-signup', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { email, password, full_name, phone, store_name } = req.body || {};
+    const { email, full_name, phone, store_name } = req.body || {};
 
-    // ─── Validation ───
+    // ═══ Validation ═══
     if (!email || !email.includes('@')) {
-      return res.status(400).json({ error: 'invalid_email', error_description: 'Invalid email' });
-    }
-    if (!password || password.length < 6) {
-      return res.status(400).json({ error: 'weak_password', error_description: 'Password must be at least 6 characters' });
+      return res.status(400).json({
+        error: 'invalid_email',
+        error_description: 'Invalid email',
+      });
     }
     if (!full_name || !full_name.trim()) {
-      return res.status(400).json({ error: 'missing_name', error_description: 'Full name is required' });
+      return res.status(400).json({
+        error: 'missing_name',
+        error_description: 'Full name is required',
+      });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
 
+    // ⭐ كلمة المرور الثابتة (بدون المستخدم)
+    const DEFAULT_PASSWORD = 'Trial123!';
+    const passwordHash = await bcrypt.hash(DEFAULT_PASSWORD, 10);
+
     await client.query('BEGIN');
 
-    // ─── 1. فحص وجود بريد مسجّل ───
+    // ═══ 1. فحص وجود بريد مسجّل ═══
     const { rows: existingUser } = await client.query(
-      `SELECT id FROM users WHERE email = $1`, [normalizedEmail]
+      `SELECT id FROM users WHERE email = $1`,
+      [normalizedEmail]
     );
     if (existingUser.length) {
       await client.query('ROLLBACK');
@@ -949,7 +959,8 @@ router.post('/trial-signup', async (req, res) => {
     }
 
     const { rows: existingTrial } = await client.query(
-      `SELECT id FROM trial_signups WHERE email = $1`, [normalizedEmail]
+      `SELECT id FROM trial_signups WHERE email = $1`,
+      [normalizedEmail]
     );
     if (existingTrial.length) {
       await client.query('ROLLBACK');
@@ -959,7 +970,7 @@ router.post('/trial-signup', async (req, res) => {
       });
     }
 
-    // ─── 2. إنشاء tenant ───
+    // ═══ 2. إنشاء tenant ═══
     const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
     const { rows: tenantRows } = await client.query(
@@ -977,10 +988,7 @@ router.post('/trial-signup', async (req, res) => {
     );
     const tenant = tenantRows[0];
 
-    // ⭐⭐⭐ 3. تشفير كلمة المرور ⭐⭐⭐
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    // ─── 4. إنشاء trial_signups (مع password_hash) ───
+    // ═══ 3. إنشاء trial_signups (مع password_hash) ═══
     const trialId = crypto.randomUUID();
 
     await client.query(
@@ -996,64 +1004,44 @@ router.post('/trial-signup', async (req, res) => {
         tenant.id,
         tenant.name,
         trialEndsAt,
-        passwordHash,        // ← ⭐ جديد
+        passwordHash,
       ]
     );
 
     await client.query('COMMIT');
 
-    // ─── 5. تسجيل دخول تلقائي ───
-    const trialUser = {
-      id: trialId,
-      email: normalizedEmail,
-      full_name: full_name.trim(),
-      role: 'trial_store_admin',
-      tenant_id: tenant.id,
-      organization_id: null,
-      is_active: true,
-      invite_status: 'accepted',
-    };
-
-    const accessToken = jwt.sign(
-      {
-        sub: trialId,
+    // ═══ 4. الرد — بدون JWT (المستخدم يذهب لـ /login) ═══
+    res.status(201).json({
+      ok: true,
+      success: true,
+      user: {
+        id: trialId,
         email: normalizedEmail,
+        full_name: full_name.trim(),
         role: 'trial_store_admin',
         tenant_id: tenant.id,
-        organization_id: null,
+        invite_status: 'accepted',
       },
-      JWT_SECRET,
-      { expiresIn: JWT_EXPIRES_IN }
-    );
-
-    res.status(201).json({
-      access_token: accessToken,
-      token_type: 'bearer',
-      expires_in: 3600,
-      expires_at: new Date(Date.now() + 3600 * 1000).toISOString(),
-      refresh_token: null,
-      user: trialUser,
       context: {
         plan: 'trial',
         subscription_status: 'active',
         subscription_expires_at: trialEndsAt,
         context_type: 'tenant',
-        hq_tenant_id: null,
-        organization: null,
-        tenant: { id: tenant.id, name: tenant.name, is_active: true },
+        tenant: { id: tenant.id, name: tenant.name },
       },
-      is_trial: true,
       trial: {
         starts_at: new Date().toISOString(),
         ends_at: trialEndsAt,
         days_total: 7,
       },
     });
-
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('❌ Trial signup error:', err.message);
-    res.status(500).json({ error: 'server_error', error_description: err.message });
+    res.status(500).json({
+      error: 'server_error',
+      error_description: err.message,
+    });
   } finally {
     client.release();
   }
