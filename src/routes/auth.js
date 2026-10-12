@@ -764,26 +764,39 @@ router.put('/user', validate(updatePasswordSchema), async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  POST /auth/v1/2fa/verify-login — التحقق من 2FA أثناء الدخول
+//  POST /auth/v1/2fa/verify-login — التحقق من 2FA أثناء Login
+//  ⭐ يستخدم TOTP الحقيقي + context كامل
 // ═══════════════════════════════════════════════════════════
 router.post('/2fa/verify-login', async (req, res) => {
   try {
     const { temp_token, code } = req.body || {};
+
     if (!temp_token || !code) {
-      return res.status(400).json({ error: 'invalid_request', error_description: 'temp_token and code required' });
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'temp_token and code required',
+      });
     }
 
+    // فك temp_token
     let payload;
     try {
       payload = jwt.verify(temp_token, JWT_SECRET);
     } catch (err) {
-      return res.status(401).json({ error: 'invalid_token', error_description: 'Invalid or expired temp token' });
+      return res.status(401).json({
+        error: 'invalid_token',
+        error_description: 'Invalid or expired temp token',
+      });
     }
 
     if (payload.purpose !== '2fa_pending') {
-      return res.status(403).json({ error: 'invalid_purpose', error_description: 'Token not for 2FA' });
+      return res.status(403).json({
+        error: 'invalid_purpose',
+        error_description: 'Token not for 2FA',
+      });
     }
 
+    // جلب user + secret
     const { rows } = await pool.query(
       `SELECT u.id, u.email, u.full_name, u.role, u.tenant_id, u.organization_id,
               u.is_active, u.invite_status,
@@ -794,37 +807,66 @@ router.post('/2fa/verify-login', async (req, res) => {
       [payload.sub]
     );
 
-    if (!rows.length) {
+    if (rows.length === 0) {
       return res.status(404).json({ error: 'user_not_found' });
     }
 
     const user = rows[0];
+
     if (!user.enabled) {
-      return res.status(400).json({ error: 'invalid_request', error_description: '2FA not enabled' });
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: '2FA not enabled',
+      });
     }
 
-    const normalizedCode = String(code).trim();
-    const isValid =
-      normalizedCode === '123456' || // dev only
-      normalizedCode === generateSimpleCode(user.secret);
+    if (user.is_active === false) {
+      return res.status(403).json({
+        error: 'account_disabled',
+        error_description: 'Account is disabled',
+      });
+    }
+
+    // ═══ التحقق بـ TOTP ═══
+    const { authenticator } = require('otplib');
+    authenticator.options = { window: 1, step: 30, digits: 6 };
+
+    const isValid = authenticator.verify({
+      token: String(code).trim(),
+      secret: user.secret,
+    });
 
     if (!isValid) {
-      return res.status(400).json({ error: 'invalid_code', error_description: 'Invalid 2FA code' });
+      return res.status(400).json({
+        error: 'invalid_code',
+        error_description: 'Invalid 2FA code',
+      });
     }
 
+    // ═══ تحديث last_login + invite_status ═══
+    await pool.query(
+      `UPDATE users
+       SET last_login = NOW(),
+           invite_status = CASE
+             WHEN invite_status = 'pending' THEN 'accepted'
+             ELSE invite_status
+           END,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [user.id]
+    );
+
+    // ═══ بناء auth response كامل ═══
     const response = await buildAuthResponse(user, req);
     res.json(response);
   } catch (err) {
     console.error('❌ 2FA verify-login error:', err.message);
-    res.status(500).json({ error: 'server_error', error_description: err.message });
+    res.status(500).json({
+      error: 'server_error',
+      error_description: err.message,
+    });
   }
 });
-
-// ─── Helper: رمز بسيط (dev) ───
-function generateSimpleCode(secret) {
-  const hash = crypto.createHash('sha256').update(secret).digest('hex');
-  return hash.substring(0, 6).replace(/[a-f]/g, '1');
-}
 
 // ═══════════════════════════════════════════════════════════
 //  POST /auth/v1/logout — تسجيل خروج (إبطال refresh tokens)
