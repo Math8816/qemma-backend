@@ -115,6 +115,11 @@ router.post('/restore/:id', optionalAuth, async (req, res) => {
     const { id: scopeId, type: scopeType } = getScope(req);
     const { id } = req.params;
 
+    // ⭐ تحقق مبكر
+    if (!id || id === 'undefined' || id === 'null') {
+      return res.status(400).json({ ok: false, error: 'Backup ID required' });
+    }
+
     const exists = await backupStorage.exists(id);
     if (!exists) {
       return res.status(404).json({ ok: false, error: 'Backup not found' });
@@ -129,6 +134,10 @@ router.post('/restore/:id', optionalAuth, async (req, res) => {
       message: 'تمت الاستعادة بنجاح',
     });
   } catch (err) {
+    // ⭐ حوّل "not found" إلى 404
+    if (err.message === 'Backup not found') {
+      return res.status(404).json({ ok: false, error: 'Backup not found' });
+    }
     console.error('POST /api/backup/restore error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -147,6 +156,12 @@ router.get('/download/:id', optionalAuth, async (req, res) => {
     }
 
     const { id } = req.params;
+
+    // ⭐ تحقق مبكر
+    if (!id || id === 'undefined' || id === 'null') {
+      return res.status(404).json({ ok: false, error: 'Backup not found' });
+    }
+
     const exists = await backupStorage.exists(id);
     if (!exists) {
       return res.status(404).json({ ok: false, error: 'Backup not found' });
@@ -159,6 +174,10 @@ router.get('/download/:id', optionalAuth, async (req, res) => {
     res.set('Content-Disposition', `attachment; filename="${fileName}"`);
     res.send(JSON.stringify(data, null, 2));
   } catch (err) {
+    // ⭐ حوّل "not found" إلى 404
+    if (err.message === 'Backup not found') {
+      return res.status(404).json({ ok: false, error: 'Backup not found' });
+    }
     console.error('GET /api/backup/download error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -171,8 +190,12 @@ router.delete('/:id', optionalAuth, async (req, res) => {
   try {
     if (!requireAuth(req, res)) return;
 
-    const { id: scopeId, type: scopeType } = getScope(req);
     const { id } = req.params;
+
+    // ⭐ تحقق مبكر
+    if (!id || id === 'undefined' || id === 'null') {
+      return res.status(404).json({ ok: false, error: 'Backup not found' });
+    }
 
     const exists = await backupStorage.exists(id);
     if (!exists) {
@@ -183,6 +206,9 @@ router.delete('/:id', optionalAuth, async (req, res) => {
 
     res.json({ ok: true, deleted: result.deleted ? id : null });
   } catch (err) {
+    if (err.message === 'Backup not found') {
+      return res.status(404).json({ ok: false, error: 'Backup not found' });
+    }
     console.error('DELETE /api/backup error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }

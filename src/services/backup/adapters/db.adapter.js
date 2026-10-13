@@ -59,15 +59,78 @@ async function save(id, scopeType, scopeId, data, metadata = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  📖 Load
+//  📋 List — يُرجع حقولاً موحدة
+// ═══════════════════════════════════════════════════════════
+async function list(scopeType, scopeId) {
+  const { rows } = await pool.query(
+    `SELECT id, scope_type, scope_id, size_bytes, 
+            size_compressed_bytes, tables_count, records_count,
+            created_by_email, created_at, notes, version
+     FROM backups
+     WHERE scope_type = $1 AND scope_id = $2
+     ORDER BY created_at DESC`,
+    [scopeType, scopeId]
+  );
+
+  return rows.map((r) => ({
+    id: r.id,
+    name: `backup-${r.id}.json`,              // ⭐ name مُولَّد
+    scopeType: r.scope_type,
+    scopeId: r.scope_id,
+    sizeBytes: r.size_bytes,
+    size: r.size_bytes,                        // ⭐ alias
+    sizeCompressed: r.size_compressed_bytes,
+    tablesCount: r.tables_count,
+    recordsCount: r.records_count,
+    createdBy: r.created_by_email,
+    createdAt: r.created_at,
+    created_at: r.created_at,                  // ⭐ alias
+    updated_at: r.created_at,                  // ⭐ alias
+    notes: r.notes,
+    version: r.version,
+  }));
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ❓ Exists — آمن (لا يرمي)
+// ═══════════════════════════════════════════════════════════
+async function exists(id) {
+  try {
+    if (!id || id === 'undefined' || id === 'null') return false;
+    const { rows } = await pool.query(
+      'SELECT 1 FROM backups WHERE id = $1 LIMIT 1',
+      [id]
+    );
+    return rows.length > 0;
+  } catch (err) {
+    // ⭐ UUID غير صالح → 22P02
+    if (err.code === '22P02') return false;
+    console.error('exists error:', err.message);
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  📖 Load — آمن
 // ═══════════════════════════════════════════════════════════
 async function load(id) {
-  const { rows } = await pool.query(
-    `SELECT data_compressed, size_bytes, tables_count, 
-            records_count, created_at, version
-     FROM backups WHERE id = $1`,
-    [id]
-  );
+  if (!id || id === 'undefined' || id === 'null') {
+    throw new Error('Backup not found');
+  }
+
+  let rows;
+  try {
+    const res = await pool.query(
+      `SELECT data_compressed, size_bytes, tables_count, 
+              records_count, created_at, version
+       FROM backups WHERE id = $1`,
+      [id]
+    );
+    rows = res.rows;
+  } catch (err) {
+    if (err.code === '22P02') throw new Error('Backup not found');
+    throw err;
+  }
 
   if (rows.length === 0) {
     throw new Error('Backup not found');
@@ -75,13 +138,9 @@ async function load(id) {
 
   const row = rows[0];
 
-  // 1. Base64 → Buffer
+  // ─── فك الضغط ───
   const compressed = Buffer.from(row.data_compressed, 'base64');
-
-  // 2. Gunzip
   const jsonBuffer = await gunzip(compressed);
-
-  // 3. Parse
   const data = JSON.parse(jsonBuffer.toString('utf8'));
 
   return {
@@ -98,54 +157,23 @@ async function load(id) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  📋 List
-// ═══════════════════════════════════════════════════════════
-async function list(scopeType, scopeId) {
-  const { rows } = await pool.query(
-    `SELECT id, scope_type, scope_id, size_bytes, 
-            size_compressed_bytes, tables_count, records_count,
-            created_by_email, created_at, notes, version
-     FROM backups
-     WHERE scope_type = $1 AND scope_id = $2
-     ORDER BY created_at DESC`,
-    [scopeType, scopeId]
-  );
-
-  return rows.map((r) => ({
-    id: r.id,
-    scopeType: r.scope_type,
-    scopeId: r.scope_id,
-    sizeBytes: r.size_bytes,
-    sizeCompressed: r.size_compressed_bytes,
-    tablesCount: r.tables_count,
-    recordsCount: r.records_count,
-    createdBy: r.created_by_email,
-    createdAt: r.created_at,
-    notes: r.notes,
-    version: r.version,
-  }));
-}
-
-// ═══════════════════════════════════════════════════════════
-//  🗑️ Delete
+//  🗑️ Remove — آمن
 // ═══════════════════════════════════════════════════════════
 async function remove(id) {
-  const { rowCount } = await pool.query(
-    'DELETE FROM backups WHERE id = $1',
-    [id]
-  );
-  return { deleted: rowCount > 0 };
-}
+  if (!id || id === 'undefined' || id === 'null') {
+    return { deleted: false };
+  }
 
-// ═══════════════════════════════════════════════════════════
-//  ❓ Exists
-// ═══════════════════════════════════════════════════════════
-async function exists(id) {
-  const { rows } = await pool.query(
-    'SELECT 1 FROM backups WHERE id = $1',
-    [id]
-  );
-  return rows.length > 0;
+  try {
+    const { rowCount } = await pool.query(
+      'DELETE FROM backups WHERE id = $1',
+      [id]
+    );
+    return { deleted: rowCount > 0 };
+  } catch (err) {
+    if (err.code === '22P02') return { deleted: false };
+    throw err;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
