@@ -20,7 +20,7 @@ function requireRole(user, roles) {
 }
 
 function getMaxBranches(plan) {
-  return { premium: 10, enterprise: 999 }[plan] || 1;
+  return { premium: 3, enterprise: 6 }[plan] || 1;
 }
 
 // ═══ POST /api/organizations ═══
