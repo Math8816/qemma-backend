@@ -11,6 +11,7 @@ const pool = require('../db');
 const { queryAsUser } = require('../db-rls');
 const { optionalAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
+const { idempotencyMiddleware } = require('../middleware/idempotency');
 
 const router = express.Router();
 router.use(auditMiddleware);
@@ -375,7 +376,7 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
 // ═══════════════════════════════════════════════
 //  POST /api/ledger/rls — إدراج قيد
 // ═══════════════════════════════════════════════
-router.post('/rls', optionalAuth, async (req, res) => {
+router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
   try {
     const user = req.user;
     if (!user || !user.sub) {

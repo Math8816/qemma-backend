@@ -9,6 +9,7 @@ const pool = require('../db');
 const { queryAsUser } = require('../db-rls');
 const { optionalAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
+const { idempotencyMiddleware } = require('../middleware/idempotency');
 
 const router = express.Router();
 router.use(auditMiddleware);
@@ -103,7 +104,7 @@ router.get('/rls/:id', optionalAuth, async (req, res) => {
 //  POST /api/sales-invoices/rls
 //  إنشاء فاتورة كاملة: invoice + items + stock + ledger
 // ═══════════════════════════════════════════════
-router.post('/rls', optionalAuth, async (req, res) => {
+router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
     const user = req.user;
