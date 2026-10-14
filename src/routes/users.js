@@ -65,69 +65,77 @@ router.get('/:id', optionalAuth, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════
-//  POST /api/users — إنشاء مستخدم (مع كلمة مرور)
-// ═══════════════════════════════════════════════
-router.post('/', optionalAuth, async (req, res) => {
+// ═══════════════════════════════════════════════════════════
+//  GET /api/users — فلترة حسب الدور + RLS
+// ═══════════════════════════════════════════════════════════
+router.get('/', optionalAuth, async (req, res) => {
   try {
-    const currentUser = req.user;
-    if (!currentUser || !currentUser.sub) {
+    const user = req.user;
+    if (!user?.sub) {
       return res.status(401).json({ ok: false, error: 'Authentication required' });
     }
 
-    const { id, email, full_name, role, password, tenant_id, organization_id, is_active } = req.body;
+    let whereClause = 'WHERE 1=1';
+    const params = [];
 
-    // ─── التحقق من المدخلات ───
-    if (!id) {
-      return res.status(400).json({ ok: false, error: 'id (UUID) is required' });
-    }
-    if (!email) {
-      return res.status(400).json({ ok: false, error: 'email is required' });
-    }
-    if (!role) {
-      return res.status(400).json({ ok: false, error: 'role is required' });
+    // ─── فلترة حسب دور الطالب ───
+    if (user.role === 'developer') {
+      // Developer → كل المستخدمين
+    } else if (['owner', 'org_admin', 'org_accountant'].includes(user.role)) {
+      // Owner → مستخدمي سلسته
+      if (user.organization_id) {
+        params.push(user.organization_id);
+        whereClause += ` AND organization_id = $${params.length}`;
+      }
+    } else if (['store_admin', 'store_manager'].includes(user.role)) {
+      // Store Admin → موظفي فرعه فقط
+      if (user.tenant_id) {
+        params.push(user.tenant_id);
+        whereClause += ` AND tenant_id = $${params.length}`;
+      }
+
+      // ⭐ استبعاد الأدوار الإدارية العليا
+      whereClause += ` AND role NOT IN ('developer', 'owner', 'org_admin', 'org_accountant')`;
+    } else {
+      // باقي الأدوار → لا يرون أحد
+      return res.json({ ok: true, count: 0, data: [] });
     }
 
-    // ─── تشفير كلمة المرور (إن وُجدت) ───
-    let passwordHash = null;
-    if (password && password.trim().length > 0) {
-      passwordHash = await bcrypt.hash(password, 10);
+    // ─── فلترة اختيارية (Developer فقط) ───
+    const { tenant_id, role, is_active } = req.query;
+
+    if (tenant_id && user.role === 'developer') {
+      params.push(tenant_id);
+      whereClause += ` AND tenant_id = $${params.length}`;
     }
 
-    // ─── tenant من JWT (للأمان) ───
-    const finalTenantId = tenant_id || currentUser.tenant_id || null;
-    const finalOrgId = organization_id || currentUser.organization_id || null;
+    if (role && user.role === 'developer') {
+      params.push(role);
+      whereClause += ` AND role = $${params.length}`;
+    }
 
-    const result = await queryAsUser(
-      currentUser,
-      `INSERT INTO users (id, email, full_name, role, password_hash, tenant_id, organization_id, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, email, full_name, role, tenant_id, organization_id, is_active, created_at`,
-      [
-        id,
-        email.toLowerCase().trim(),
-        full_name || null,
-        role,
-        passwordHash,
-        finalTenantId,
-        finalOrgId,
-        is_active !== undefined ? is_active : true,
-      ]
+    if (is_active !== undefined) {
+      params.push(is_active === 'true');
+      whereClause += ` AND is_active = $${params.length}`;
+    }
+
+    const result = await pool.query(
+      `SELECT id, email, full_name, role, tenant_id, organization_id,
+              is_active, invite_status, created_at
+       FROM users
+       ${whereClause}
+       ORDER BY created_at DESC
+       LIMIT 200`,
+      params
     );
 
-    await req.audit({
-      action: 'create',
-      tableName: 'users',
-      recordId: result.rows[0].id,
-      newData: result.rows[0],
+    res.json({
+      ok: true,
+      count: result.rows.length,
+      data: result.rows,
     });
-
-    res.status(201).json({ ok: true, data: result.rows[0] });
   } catch (err) {
-    console.error('POST /users error:', err.message);
-    if (err.code === '23505') {
-      return res.status(409).json({ ok: false, error: 'Email or ID already exists' });
-    }
+    console.error('GET /users error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
