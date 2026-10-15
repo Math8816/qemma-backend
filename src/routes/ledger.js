@@ -313,6 +313,42 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'tenant_id required' });
     }
 
+    // ═══════════════════════════════════════════════════════════
+    //  1️⃣ حساب الرصيد الافتتاحي (قبل start_date)
+    // ═══════════════════════════════════════════════════════════
+    let openingBalance = 0;
+
+    if (start_date) {
+      const openingRes = await queryAsUser(
+        user,
+        `SELECT
+           COALESCE(SUM(debit), 0)::numeric AS total_debit,
+           COALESCE(SUM(credit), 0)::numeric AS total_credit
+         FROM ledger_entries
+         WHERE tenant_id = $1
+           AND account_id = $2
+           AND account_type = $3
+           AND entry_date < $4`,
+        [tenantId, req.params.accountId, accountType, start_date]
+      );
+
+      const row = openingRes.rows[0] || {};
+      const totalDebit = Number(row.total_debit) || 0;
+      const totalCredit = Number(row.total_credit) || 0;
+
+      // نفس sign convention
+      if (accountType === 'customer') {
+        openingBalance = totalDebit - totalCredit;
+      } else if (accountType === 'supplier') {
+        openingBalance = totalCredit - totalDebit;
+      } else {
+        openingBalance = totalDebit - totalCredit;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2️⃣ جلب الحركات داخل الفترة
+    // ═══════════════════════════════════════════════════════════
     let whereClause = 'WHERE tenant_id = $1 AND account_id = $2 AND account_type = $3';
     const params = [tenantId, req.params.accountId, accountType];
 
@@ -334,21 +370,46 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       params
     );
 
-    let runningBalance = 0;
+    // ═══════════════════════════════════════════════════════════
+    //  3️⃣ بناء الكشف مع running_balance صحيح
+    // ═══════════════════════════════════════════════════════════
+    let runningBalance = openingBalance;   // ⭐ ابدأ من الرصيد الافتتاحي
+
     const statement = result.rows.map((entry) => {
       const debit = Number(entry.debit) || 0;
       const credit = Number(entry.credit) || 0;
 
       if (accountType === 'customer') {
         runningBalance += debit - credit;
-      } else {
+      } else if (accountType === 'supplier') {
         runningBalance += credit - debit;
+      } else {
+        runningBalance += debit - credit;
       }
 
       return { ...entry, running_balance: runningBalance };
     });
 
-    const summary = statement.reduce(
+    // ═══════════════════════════════════════════════════════════
+    //  4️⃣ إضافة صف "رصيد افتتاحي" في البداية (إن وُجد)
+    // ═══════════════════════════════════════════════════════════
+    if (start_date && openingBalance !== 0) {
+      statement.unshift({
+        id: '__opening__',
+        entry_date: start_date,
+        entry_type: 'opening',
+        description: 'رصيد افتتاحي',
+        debit: accountType === 'customer' && openingBalance > 0 ? openingBalance : 0,
+        credit: accountType === 'customer' && openingBalance < 0 ? Math.abs(openingBalance) : 0,
+        running_balance: openingBalance,
+        is_opening: true,   // ⭐ علم للفرونت
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5️⃣ حساب الملخص
+    // ═══════════════════════════════════════════════════════════
+    const summary = result.rows.reduce(
       (acc, e) => {
         acc.total_debit += Number(e.debit) || 0;
         acc.total_credit += Number(e.credit) || 0;
@@ -357,13 +418,17 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       { total_debit: 0, total_credit: 0 }
     );
 
-    summary.balance = runningBalance;
+    summary.opening_balance = openingBalance;   // ⭐ جديد
+    summary.closing_balance = runningBalance;    // الرصيد النهائي
+    summary.balance = runningBalance;            // للتوافق مع الكود القديم
     summary.entries_count = statement.length;
 
     res.json({
       ok: true,
       accountId: req.params.accountId,
       accountType,
+      opening_balance: openingBalance,   // ⭐ للفرونت مباشرة
+      closing_balance: runningBalance,   // ⭐ للفرونت مباشرة
       statement,
       summary,
     });
@@ -584,9 +649,11 @@ router.post('/rls/record-invoice', optionalAuth, async (req, res) => {
 //  POST /api/ledger/rls/record-payment — قيد دفعة
 // ═══════════════════════════════════════════════
 router.post('/rls/record-payment', optionalAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
     const user = req.user;
     if (!user || !user.sub) {
+      client.release();
       return res.status(401).json({ ok: false, error: 'Authentication required' });
     }
 
@@ -603,6 +670,7 @@ router.post('/rls/record-payment', optionalAuth, async (req, res) => {
     } = req.body;
 
     if (!accountId || !accountType || !amount) {
+      client.release();
       return res.status(400).json({
         ok: false,
         error: 'accountId, accountType, amount are required',
@@ -612,11 +680,19 @@ router.post('/rls/record-payment', optionalAuth, async (req, res) => {
     const tenantId = user.tenant_id;
     const organizationId = user.organization_id || null;
     const finalDate = entryDate || new Date().toISOString().split('T')[0];
+    const numAmount = Number(amount);
 
     const isCustomer = accountType === 'customer';
 
-    const result = await queryAsUser(
-      user,
+    // ═══════════════════════════════════════════════════════════
+    //  🔐 Transaction: قيد + تحديث الفاتورة + cache
+    // ═══════════════════════════════════════════════════════════
+    await client.query('BEGIN');
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
+    await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
+
+    // ─── 1. إدراج القيد ───
+    const entryRes = await client.query(
       `INSERT INTO ledger_entries
         (tenant_id, organization_id, account_id, account_type,
          entry_type, reference_id, reference_number,
@@ -630,8 +706,8 @@ router.post('/rls/record-payment', optionalAuth, async (req, res) => {
         accountType,
         invoiceId || null,
         invoiceNumber || null,
-        isCustomer ? 0 : Number(amount),
-        isCustomer ? Number(amount) : 0,
+        isCustomer ? 0 : numAmount,
+        isCustomer ? numAmount : 0,
         notes || (isCustomer ? 'استلام من عميل' : 'دفع لمورد'),
         finalDate,
         JSON.stringify({
@@ -642,24 +718,80 @@ router.post('/rls/record-payment', optionalAuth, async (req, res) => {
         }),
       ]
     );
+    const entry = entryRes.rows[0];
+
+    // ─── 2. تحديث الفاتورة (إن وُجد رقم) ───
+    let invoiceUpdate = null;
+
+    if (invoiceNumber) {
+      const table = isCustomer ? 'sales_invoices' : 'purchase_invoices';
+
+      // جلب الفاتورة الحالية
+      const invRes = await client.query(
+        `SELECT id, paid, total, remaining
+         FROM ${table}
+         WHERE invoice_number = $1 AND tenant_id = $2`,
+        [invoiceNumber, tenantId]
+      );
+
+      if (invRes.rows.length > 0) {
+        const inv = invRes.rows[0];
+        const newPaid = Number(inv.paid || 0) + numAmount;
+        const newRemaining = Math.max(0, Number(inv.total || 0) - newPaid);
+        const newStatus = newRemaining <= 0 ? 'paid' : 'pending';
+
+        await client.query(
+          `UPDATE ${table}
+           SET paid = $1,
+               remaining = $2,
+               status = $3,
+               updated_at = NOW()
+           WHERE id = $4 AND tenant_id = $5`,
+          [newPaid, newRemaining, newStatus, inv.id, tenantId]
+        );
+
+        invoiceUpdate = {
+          invoiceId: inv.id,
+          invoiceNumber,
+          paid: newPaid,
+          remaining: newRemaining,
+          status: newStatus,
+        };
+      }
+    }
+
+    // ─── 3. تحديث cache الرصيد ───
+    await refreshBalanceCache(client, user, tenantId, accountId, accountType);
+
+    // ─── 4. جلب الرصيد الجديد ───
+    const balanceRes = await client.query(
+      `SELECT balance FROM ${isCustomer ? 'customers' : 'suppliers'}
+       WHERE id = $1 AND tenant_id = $2`,
+      [accountId, tenantId]
+    );
+    const newBalance = balanceRes.rows[0]?.balance || 0;
+
+    await client.query('COMMIT');
 
     await req.audit({
       action: 'create',
       tableName: 'ledger_entries',
-      recordId: result.rows[0].id,
-      newData: result.rows[0],
+      recordId: entry.id,
+      newData: entry,
     });
-
-    const cacheUpdate = await refreshAccountCache(user, tenantId, accountId, accountType);
 
     res.status(201).json({
       ok: true,
-      data: result.rows[0],
-      cache: cacheUpdate,
+      data: entry,
+      invoice: invoiceUpdate,
+      cache: { success: true, balance: newBalance },
     });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('POST /ledger/rls/record-payment error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 

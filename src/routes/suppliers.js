@@ -58,6 +58,7 @@ router.get('/rls/list', optionalAuth, async (req, res) => {
          c.color AS category_color
        FROM suppliers s
        LEFT JOIN categories c ON c.id = s.category_id
+       WHERE s.is_active = true
        ORDER BY s.name
        LIMIT 500`
     );
@@ -128,9 +129,11 @@ router.get('/:id', async (req, res) => {
 //  POST /api/suppliers/rls — إنشاء (مع RLS)
 // ═══════════════════════════════════════════════
 router.post('/rls', optionalAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
     const user = req.user;
     if (!user || !user.sub) {
+      client.release();
       return res.status(401).json({ ok: false, error: 'Authentication required' });
     }
 
@@ -140,6 +143,7 @@ router.post('/rls', optionalAuth, async (req, res) => {
     } = req.body;
 
     if (!name || name.trim() === '') {
+      client.release();
       return res.status(400).json({ ok: false, error: 'name is required' });
     }
 
@@ -147,18 +151,26 @@ router.post('/rls', optionalAuth, async (req, res) => {
     const organizationId = user.organization_id || null;
 
     if (!tenantId) {
+      client.release();
       return res.status(400).json({ ok: false, error: 'tenant_id required in token' });
     }
 
     const openingBal = Number(opening_balance) || 0;
 
-    const result = await queryAsUser(
-      user,
+    // ═══════════════════════════════════════════════════════════
+    //  🔐 Transaction: مورد + قيد افتتاحي
+    // ═══════════════════════════════════════════════════════════
+    await client.query('BEGIN');
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
+    await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
+
+    // ─── 1. إنشاء المورد ───
+    const supResult = await client.query(
       `INSERT INTO suppliers
          (name, phone, email, address, category_id,
           opening_balance, balance, total_paid,
-          tenant_id, organization_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          tenant_id, organization_id, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
        RETURNING *`,
       [
         name.trim(),
@@ -174,17 +186,54 @@ router.post('/rls', optionalAuth, async (req, res) => {
       ]
     );
 
+    const supplier = supResult.rows[0];
+
+    // ─── 2. قيد الرصيد الافتتاحي ───
+    if (openingBal !== 0) {
+      let debit = 0;
+      let credit = 0;
+      const numAmount = Math.abs(openingBal);
+
+      // supplier: موجب = علينا له (credit)
+      if (openingBal > 0) credit = numAmount;
+      else debit = numAmount;
+
+      await client.query(
+        `INSERT INTO ledger_entries
+          (tenant_id, organization_id, account_id, account_type,
+           entry_type, reference_id, reference_number,
+           debit, credit, description, entry_date, metadata)
+         VALUES ($1, $2, $3, 'supplier', 'opening', NULL, NULL,
+                 $4, $5, $6, $7, $8)`,
+        [
+          tenantId,
+          organizationId,
+          supplier.id,
+          debit,
+          credit,
+          `رصيد افتتاحي - ${supplier.name}`,
+          new Date().toISOString().split('T')[0],
+          JSON.stringify({ source: 'opening_balance' }),
+        ]
+      );
+    }
+
+    await client.query('COMMIT');
+
     await req.audit({
       action: 'create',
       tableName: 'suppliers',
-      recordId: result.rows[0].id,
-      newData: result.rows[0],
+      recordId: supplier.id,
+      newData: supplier,
     });
 
-    res.status(201).json({ ok: true, data: result.rows[0] });
+    res.status(201).json({ ok: true, data: supplier });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('POST /suppliers/rls error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -260,24 +309,51 @@ router.delete('/rls/:id', optionalAuth, async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Authentication required' });
     }
 
-    const result = await queryAsUser(
+    // ─── 1. تحقق من وجود المورد + الرصيد ───
+    const checkRes = await queryAsUser(
       user,
-      `DELETE FROM suppliers WHERE id = $1 RETURNING *`,
+      `SELECT id, balance, name 
+       FROM suppliers 
+       WHERE id = $1 AND is_active = true`,
       [req.params.id]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ ok: false, error: 'Supplier not found or access denied' });
+    if (checkRes.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Supplier not found' });
     }
 
+    const supplier = checkRes.rows[0];
+    const balance = Number(supplier.balance) || 0;
+
+    // ─── 2. منع الحذف إذا فيه رصيد ───
+    if (Math.abs(balance) > 0.01) {
+      return res.status(409).json({
+        ok: false,
+        error: 'SUPPLIER_HAS_BALANCE',
+        error_description: `لا يمكن حذف "${supplier.name}" — رصيده ${balance.toFixed(2)}. سوّ الرصيد أولاً.`,
+      });
+    }
+
+    // ─── 3. Soft Delete ───
+    const result = await queryAsUser(
+      user,
+      `UPDATE suppliers
+       SET is_active = false,
+           deleted_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [req.params.id]
+    );
+
     await req.audit({
-      action: 'delete',
+      action: 'soft_delete',
       tableName: 'suppliers',
       recordId: result.rows[0].id,
       oldData: result.rows[0],
     });
 
-    res.json({ ok: true, deleted: result.rows[0] });
+    res.json({ ok: true, deleted: result.rows[0], soft: true });
   } catch (err) {
     console.error('DELETE /suppliers/rls error:', err.message);
     res.status(500).json({ ok: false, error: err.message });

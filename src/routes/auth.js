@@ -531,47 +531,6 @@ router.get('/user', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  POST /auth/v1/signup
-// ═══════════════════════════════════════════════════════════
-router.post('/signup', validate(signupSchema), async (req, res) => {
-  try {
-    const { email, password, full_name, role, tenant_id, organization_id } = req.body || {};
-    const normalizedEmail = email.toLowerCase().trim();
-
-    const { rows: existing } = await pool.query(
-      `SELECT id FROM users WHERE email = $1`,
-      [normalizedEmail]
-    );
-    if (existing.length > 0) {
-      return res.status(409).json({
-        error: 'user_already_exists',
-        error_description: 'Email already registered',
-      });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 10);
-    const newUserId = crypto.randomUUID();
-    const finalRole = role || 'employee';
-
-    const { rows } = await pool.query(
-      `INSERT INTO users
-        (id, email, full_name, role, password_hash, tenant_id, organization_id, is_active, invite_status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, true, 'accepted')
-       RETURNING id, email, full_name, role, tenant_id, organization_id, is_active, invite_status`,
-      [newUserId, normalizedEmail, full_name || null, finalRole, passwordHash,
-       tenant_id || null, organization_id || null]
-    );
-
-    const user = rows[0];
-    const response = await buildAuthResponse(user, req);
-    res.status(201).json(response);
-  } catch (err) {
-    console.error('❌ Signup error:', err.message);
-    res.status(500).json({ error: 'server_error', error_description: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════
 //  POST /auth/v1/token/refresh
 // ═══════════════════════════════════════════════════════════
 router.post('/token/refresh', async (req, res) => {
