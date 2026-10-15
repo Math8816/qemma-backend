@@ -189,7 +189,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
     }
 
     // ─── 3. stock (إضافة للمخزون) ───
-    for (const item of items) {
+        for (const item of items) {
       if (!item.product_id || !item.unit_id) continue;
 
       const stockRow = await client.query(
@@ -214,6 +214,25 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
           `INSERT INTO stock (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
            VALUES ($1, $2, $3, $4, $5, 0)`,
           [tenantId, user.organization_id || null, item.product_id, item.unit_id, newQty]
+        );
+      }
+
+      // ⭐ جديد: مزامنة product_units.quantity
+      await client.query(
+        `UPDATE product_units
+         SET quantity = $1, updated_at = NOW()
+         WHERE product_id = $2 AND unit_id = $3 AND tenant_id = $4`,
+        [newQty, item.product_id, item.unit_id, tenantId]
+      );
+
+      // ⭐ جديد: تحديث cost (آخر تكلفة شراء)
+      const itemCost = Number(item.cost || item.price || 0);
+      if (itemCost > 0) {
+        await client.query(
+          `UPDATE product_units
+           SET cost = $1, updated_at = NOW()
+           WHERE product_id = $2 AND unit_id = $3 AND tenant_id = $4`,
+          [itemCost, item.product_id, item.unit_id, tenantId]
         );
       }
 
@@ -243,7 +262,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
       );
     }
 
-    // ─── 4. Ledger (دائن على المورد) ───
+        // ─── 4. Ledger (قيد invoice) ───
     if (supplier_id && Number(total) > 0) {
       await client.query(
         `INSERT INTO ledger_entries
@@ -263,7 +282,35 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
           JSON.stringify({ invoice_number }),
         ]
       );
+    }
 
+    // ─── 5. ⭐ جديد: Ledger (قيد payment إذا paid > 0) ───
+    if (supplier_id && Number(paid) > 0) {
+      await client.query(
+        `INSERT INTO ledger_entries
+          (tenant_id, organization_id, account_id, account_type,
+           entry_type, reference_id, reference_number,
+           debit, credit, description, entry_date, metadata)
+         VALUES ($1,$2,$3,'supplier','payment',$4,$5,$6,0,$7,$8,$9)`,
+        [
+          tenantId,
+          user.organization_id || null,
+          supplier_id,
+          invoiceId,
+          invoice_number,
+          Number(paid),
+          `دفعة فاتورة ${invoice_number}`,
+          date || new Date().toISOString().split('T')[0],
+          JSON.stringify({
+            payment_type: 'invoice_payment',
+            invoice_number,
+          }),
+        ]
+      );
+    }
+
+    // ─── 6. تحديث cache (مرة واحدة) ───
+    if (supplier_id && (Number(total) > 0 || Number(paid) > 0)) {
       await client.query(
         `UPDATE suppliers s
          SET balance = COALESCE(

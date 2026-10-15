@@ -13,6 +13,135 @@ const { idempotencyMiddleware } = require('../middleware/idempotency');
 const router = express.Router();
 router.use(auditMiddleware);
 
+// ═══════════════════════════════════════════════════════════
+//  🧩 Helper: تطبيق مخزون المرتجع + Ledger (داخل transaction)
+// ═══════════════════════════════════════════════════════════
+async function applyReturnEffects(client, user, {
+  returnId,
+  returnNumber,
+  returnType,
+  accountId,
+  accountType,
+  total,
+  date,
+  items,
+}) {
+  const tenantId = user.tenant_id;
+  const organizationId = user.organization_id || null;
+  const finalDate = date || new Date().toISOString().split('T')[0];
+  const isSalesReturn = returnType === 'sales_return';
+  const direction = isSalesReturn ? 1 : -1;   // sales: +1, purchase: -1
+
+  // ─── 1. stock + inventory_log + مزامنة cache ───
+  for (const item of items) {
+    if (!item.product_id || !item.unit_id) continue;
+
+    const stockRow = await client.query(
+      `SELECT id, quantity FROM stock
+       WHERE tenant_id = $1 AND product_id = $2 AND unit_id = $3`,
+      [tenantId, item.product_id, item.unit_id]
+    );
+
+    let prevQty = 0;
+    let newQty = 0;
+
+    if (stockRow.rows.length > 0) {
+      prevQty = Number(stockRow.rows[0].quantity) || 0;
+      newQty = prevQty + direction * Number(item.quantity || 0);
+
+      if (newQty < 0) {
+        throw new Error(
+          `الكمية غير كافية للمرتجع "${item.product_name}" — المتوفر: ${prevQty}, المطلوب: ${item.quantity}`
+        );
+      }
+
+      await client.query(
+        `UPDATE stock SET quantity = $1, updated_at = NOW() WHERE id = $2`,
+        [newQty, stockRow.rows[0].id]
+      );
+    } else {
+      newQty = direction * Number(item.quantity || 0);
+      if (newQty < 0) {
+        throw new Error(`الكمية غير كافية للمرتجع "${item.product_name}"`);
+      }
+      await client.query(
+        `INSERT INTO stock (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
+         VALUES ($1, $2, $3, $4, $5, 0)`,
+        [tenantId, organizationId, item.product_id, item.unit_id, newQty]
+      );
+    }
+
+    // ⭐ مزامنة product_units.quantity
+    await client.query(
+      `UPDATE product_units
+       SET quantity = $1, updated_at = NOW()
+       WHERE product_id = $2 AND unit_id = $3 AND tenant_id = $4`,
+      [newQty, item.product_id, item.unit_id, tenantId]
+    );
+
+    // inventory_log
+    await client.query(
+      `INSERT INTO inventory_log
+        (tenant_id, organization_id, product_id, product_name, unit_id,
+         change_amount, previous_qty, new_qty, entry_type, reason,
+         reference_id, reference_number, unit_cost, total_value,
+         created_by, date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+      [
+        tenantId, organizationId,
+        item.product_id, item.product_name || null, item.unit_id,
+        direction * Number(item.quantity || 0),
+        prevQty, newQty,
+        returnType,
+        isSalesReturn ? 'مرتجع مبيعات' : 'مرتجع مشتريات',
+        returnId, returnNumber,
+        Number(item.price || 0),
+        direction * Number(item.quantity || 0) * Number(item.price || 0),
+        user.sub, finalDate,
+      ]
+    );
+  }
+
+  // ─── 2. Ledger ───
+  if (accountId && Number(total) > 0) {
+    const debit = isSalesReturn ? 0 : Number(total);
+    const credit = isSalesReturn ? Number(total) : 0;
+
+    await client.query(
+      `INSERT INTO ledger_entries
+        (tenant_id, organization_id, account_id, account_type,
+         entry_type, reference_id, reference_number,
+         debit, credit, description, entry_date, metadata)
+       VALUES ($1,$2,$3,$4,'return',$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        tenantId, organizationId,
+        accountId, accountType,
+        returnId, returnNumber,
+        debit, credit,
+        `${isSalesReturn ? 'مرتجع مبيعات' : 'مرتجع مشتريات'} ${returnNumber}`,
+        finalDate,
+        JSON.stringify({ return_type: returnType }),
+      ]
+    );
+
+    // cache update
+    const sign = isSalesReturn ? 'debit - credit' : 'credit - debit';
+    const table = isSalesReturn ? 'customers' : 'suppliers';
+
+    await client.query(
+      `UPDATE ${table}
+       SET balance = COALESCE(
+         (SELECT COALESCE(SUM(${sign}), 0)
+          FROM ledger_entries
+          WHERE tenant_id = $1 AND account_id = $2 AND account_type = $3),
+         0
+       ), updated_at = NOW()
+       WHERE id = $2 AND tenant_id = $1`,
+      [tenantId, accountId, accountType]
+    );
+  }
+}
+
 // ═══════════════════════════════════════════════
 //  GET /api/returns/rls/list — كل المرتجعات (مع الأصناف)
 // ═══════════════════════════════════════════════
@@ -209,7 +338,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
       newData: result.rows[0],
     });
 
-    res.status(201).json({ ok: true, data: result.rows[0] });
+        res.status(201).json({ ok: true, data: result.rows[0] });
   } catch (err) {
     console.error('POST /returns/rls error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
@@ -323,55 +452,187 @@ router.put('/rls/:id', optionalAuth, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════
-//  PUT /api/returns/rls/:id/status — تغيير الحالة فقط
-//  ⚠️ قبل /:id
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  PUT /api/returns/rls/:id/status
+//  ✅ Atomic: تحديث الحالة + stock + ledger في transaction واحدة
+//  ⭐ Idempotent: الاعتماد مرتين → لا تكرار
+// ═══════════════════════════════════════════════════════════
 router.put('/rls/:id/status', optionalAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
     const user = req.user;
     if (!user || !user.sub) {
+      client.release();
       return res.status(401).json({ ok: false, error: 'Authentication required' });
+    }
+    const tenantId = user.tenant_id;
+    if (!tenantId) {
+      client.release();
+      return res.status(400).json({ ok: false, error: 'tenant_id required' });
     }
 
     const { status } = req.body;
     const allowed = ['pending', 'approved', 'rejected'];
 
     if (!allowed.includes(status)) {
+      client.release();
       return res.status(400).json({ ok: false, error: 'Invalid status' });
     }
 
-    const oldResult = await queryAsUser(
-      user,
-      'SELECT * FROM returns WHERE id = $1',
-      [req.params.id]
+    await client.query('BEGIN');
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
+    await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
+
+    // ─── 1. جلب المرتجع الحالي ───
+    const fetchRes = await client.query(
+      `SELECT * FROM returns WHERE id = $1 AND tenant_id = $2`,
+      [req.params.id, tenantId]
     );
 
-    if (oldResult.rows.length === 0) {
+    if (fetchRes.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ ok: false, error: 'Return not found' });
     }
 
-    const result = await queryAsUser(
-      user,
+    const returnData = fetchRes.rows[0];
+    const previousStatus = returnData.status;
+
+    // ─── 2. Idempotency: نفس الحالة → لا شيء ───
+    if (previousStatus === status) {
+      await client.query('COMMIT');
+      return res.json({ ok: true, data: returnData, unchanged: true });
+    }
+
+    // ─── 3. جلب الأصناف ───
+    const itemsRes = await client.query(
+      `SELECT * FROM return_items WHERE return_id = $1`,
+      [req.params.id]
+    );
+    const items = itemsRes.rows;
+
+    // ─── 4. منطق التحديث ───
+    const isSalesReturn = returnData.type === 'sales_return';
+
+    // حالة 1: pending → approved (تطبيق المخزون + Ledger)
+    if (previousStatus !== 'approved' && status === 'approved') {
+      await applyReturnEffects(client, user, {
+        returnId: returnData.id,
+        returnNumber: returnData.return_number,
+        returnType: returnData.type,
+        accountId: isSalesReturn ? returnData.customer_id : returnData.supplier_id,
+        accountType: isSalesReturn ? 'customer' : 'supplier',
+        total: returnData.total,
+        date: returnData.date,
+        items,
+      });
+    }
+
+    // حالة 2: approved → rejected (إلغاء الأثر)
+    if (previousStatus === 'approved' && status !== 'approved') {
+      // عكس المخزون (direction معاكس)
+      const reverseDirection = isSalesReturn ? -1 : 1;
+
+      for (const item of items) {
+        if (!item.product_id || !item.unit_id) continue;
+
+        const stockRow = await client.query(
+          `SELECT id, quantity FROM stock
+           WHERE tenant_id = $1 AND product_id = $2 AND unit_id = $3`,
+          [tenantId, item.product_id, item.unit_id]
+        );
+
+        if (stockRow.rows.length > 0) {
+          const prevQty = Number(stockRow.rows[0].quantity) || 0;
+          const newQty = prevQty + reverseDirection * Number(item.quantity || 0);
+
+          if (newQty < 0) {
+            throw new Error(
+              `الكمية غير كافية لعكس المرتجع "${item.product_name}"`
+            );
+          }
+
+          await client.query(
+            `UPDATE stock SET quantity = $1, updated_at = NOW() WHERE id = $2`,
+            [newQty, stockRow.rows[0].id]
+          );
+
+          await client.query(
+            `UPDATE product_units
+             SET quantity = $1, updated_at = NOW()
+             WHERE product_id = $2 AND unit_id = $3 AND tenant_id = $4`,
+            [newQty, item.product_id, item.unit_id, tenantId]
+          );
+        }
+      }
+
+      // عكس Ledger
+      const accountId = isSalesReturn ? returnData.customer_id : returnData.supplier_id;
+      if (accountId && Number(returnData.total) > 0) {
+        const debit = isSalesReturn ? Number(returnData.total) : 0;
+        const credit = isSalesReturn ? 0 : Number(returnData.total);
+
+        await client.query(
+          `INSERT INTO ledger_entries
+            (tenant_id, organization_id, account_id, account_type,
+             entry_type, reference_id, reference_number,
+             debit, credit, description, entry_date, metadata)
+           VALUES ($1,$2,$3,$4,'return',$5,$6,$7,$8,$9,$10,$11)`,
+          [
+            tenantId, user.organization_id || null,
+            accountId,
+            isSalesReturn ? 'customer' : 'supplier',
+            returnData.id,
+            `${returnData.return_number}-REVERSE`,
+            debit, credit,
+            `إلغاء اعتماد المرتجع ${returnData.return_number}`,
+            new Date().toISOString().split('T')[0],
+            JSON.stringify({ reversal: true, return_type: returnData.type }),
+          ]
+        );
+
+        // cache
+        const sign = isSalesReturn ? 'debit - credit' : 'credit - debit';
+        const table = isSalesReturn ? 'customers' : 'suppliers';
+        await client.query(
+          `UPDATE ${table}
+           SET balance = COALESCE(
+             (SELECT COALESCE(SUM(${sign}), 0)
+              FROM ledger_entries
+              WHERE tenant_id = $1 AND account_id = $2 AND account_type = $3),
+             0
+           ), updated_at = NOW()
+           WHERE id = $2 AND tenant_id = $1`,
+          [tenantId, accountId, isSalesReturn ? 'customer' : 'supplier']
+        );
+      }
+    }
+
+    // ─── 5. تحديث الحالة ───
+    const updateRes = await client.query(
       `UPDATE returns
        SET status = $1, updated_at = NOW()
-       WHERE id = $2
+       WHERE id = $2 AND tenant_id = $3
        RETURNING *`,
-      [status, req.params.id]
+      [status, req.params.id, tenantId]
     );
+
+    await client.query('COMMIT');
 
     await req.audit({
       action: 'update-status',
       tableName: 'returns',
       recordId: req.params.id,
-      oldData: { status: oldResult.rows[0].status },
+      oldData: { status: previousStatus },
       newData: { status },
     });
 
-    res.json({ ok: true, data: result.rows[0] });
+    res.json({ ok: true, data: updateRes.rows[0] });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('PUT /returns/rls/:id/status error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 

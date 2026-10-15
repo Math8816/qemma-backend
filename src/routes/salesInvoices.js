@@ -196,7 +196,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
     }
 
     // ─── 3. stock (خصم من المخزون) ───
-    for (const item of items) {
+        for (const item of items) {
       if (!item.product_id || !item.unit_id) continue;
 
       // احصل على الكمية الحالية
@@ -212,18 +212,41 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
       if (stockRow.rows.length > 0) {
         prevQty = Number(stockRow.rows[0].quantity) || 0;
         newQty = prevQty - Number(item.quantity || 0);
+
+        // ⭐ جديد: منع السالب
+        if (newQty < 0) {
+          throw new Error(
+            `الكمية غير كافية للـ "${item.product_name}" — المتوفر: ${prevQty}, المطلوب: ${item.quantity}`
+          );
+        }
+
         await client.query(
           `UPDATE stock SET quantity = $1, updated_at = NOW() WHERE id = $2`,
           [newQty, stockRow.rows[0].id]
         );
       } else {
         newQty = -Number(item.quantity || 0);
+
+        if (newQty < 0) {
+          throw new Error(
+            `الكمية غير كافية للـ "${item.product_name}" — المتوفر: 0, المطلوب: ${item.quantity}`
+          );
+        }
+
         await client.query(
           `INSERT INTO stock (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
            VALUES ($1, $2, $3, $4, $5, 0)`,
           [tenantId, user.organization_id || null, item.product_id, item.unit_id, newQty]
         );
       }
+
+      // ⭐ جديد: مزامنة product_units.quantity (cache)
+      await client.query(
+        `UPDATE product_units
+         SET quantity = $1, updated_at = NOW()
+         WHERE product_id = $2 AND unit_id = $3 AND tenant_id = $4`,
+        [newQty, item.product_id, item.unit_id, tenantId]
+      );
 
       // سجل الحركة
       await client.query(
@@ -252,7 +275,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
       );
     }
 
-    // ─── 4. Ledger (قيد مدين على العميل) ───
+        // ─── 4. Ledger (قيد مدين على العميل) ───
     if (customer_id && Number(total) > 0) {
       await client.query(
         `INSERT INTO ledger_entries
@@ -272,8 +295,35 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
           JSON.stringify({ invoice_number }),
         ]
       );
+    }
 
-      // تحديث cache الرصيد
+    // ─── 5. ⭐ جديد: Ledger (قيد payment إذا paid > 0) ───
+    if (customer_id && Number(paid) > 0) {
+      await client.query(
+        `INSERT INTO ledger_entries
+          (tenant_id, organization_id, account_id, account_type,
+           entry_type, reference_id, reference_number,
+           debit, credit, description, entry_date, metadata)
+         VALUES ($1,$2,$3,'customer','payment',$4,$5,0,$6,$7,$8,$9)`,
+        [
+          tenantId,
+          user.organization_id || null,
+          customer_id,
+          invoiceId,
+          invoice_number,
+          Number(paid),
+          `دفعة فاتورة ${invoice_number}`,
+          date || new Date().toISOString().split('T')[0],
+          JSON.stringify({
+            payment_type: 'invoice_payment',
+            invoice_number,
+          }),
+        ]
+      );
+    }
+
+    // ─── 6. تحديث cache (مرة واحدة للفاتورة والدفعة) ───
+    if (customer_id && (Number(total) > 0 || Number(paid) > 0)) {
       await client.query(
         `UPDATE customers c
          SET balance = COALESCE(

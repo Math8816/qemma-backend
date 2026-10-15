@@ -138,14 +138,33 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/db-check', async (_req, res) => {
+  const isProd = process.env.NODE_ENV === 'production';
+
   try {
     const { rows } = await pool.query('SELECT NOW() AS now, current_database() AS db');
-    res.json({ ok: true, database: rows[0].db, time: rows[0].now });
-  } catch (err) {
-    // ─── سجّل الخطأ الكامل في Render Logs ───
-    console.error('❌ db-check error:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
 
-    // ─── أرجع التفاصيل للمتصفح ───
+    // ✅ في production: لا نكشف اسم قاعدة البيانات
+    res.json({
+      ok: true,
+      database: isProd ? 'connected' : rows[0].db,
+      time: rows[0].now,
+    });
+  } catch (err) {
+    // ─── سجّل الخطأ الكامل في Logs فقط ───
+    console.error(
+      '❌ db-check error:',
+      JSON.stringify(err, Object.getOwnPropertyNames(err))
+    );
+
+    // ─── في production: رسالة عامة فقط ───
+    if (isProd) {
+      return res.status(500).json({
+        ok: false,
+        error: 'database_unavailable',
+      });
+    }
+
+    // ─── في development: التفاصيل كاملة ───
     res.status(500).json({
       ok: false,
       error: err.message || 'no_message',
