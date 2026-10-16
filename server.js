@@ -91,7 +91,13 @@ app.use(
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'Idempotency-Key',      // ← جديد
+      'X-Requested-With',     // ← جديد
+    ],
+    exposedHeaders: ['Idempotency-Key'],
   })
 );
 
@@ -244,7 +250,7 @@ app.get('/', (_req, res) => {
 });
 
 // ═══════════════════════════════════════════════
-//  CORS Error Handler
+//  Error Handler — Business + Internal
 // ═══════════════════════════════════════════════
 app.use((err, req, res, _next) => {
   // ─── CORS ───
@@ -253,16 +259,29 @@ app.use((err, req, res, _next) => {
     return res.status(403).json({ ok: false, error: 'CORS blocked' });
   }
 
-  // ─── Sentry + Logger ───
+  // ─── Business Errors (4xx) ───
+  if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+    return res.status(err.statusCode).json({
+      ok: false,
+      error: err.code || 'business_error',
+      message: err.message,
+      ...(err.details && { details: err.details }),
+    });
+  }
+
+  // ─── Internal Server Errors (5xx) ───
   captureException(err, { url: req.url, method: req.method });
   logger.logError(err, { url: req.url, method: req.method });
 
-  // ─── Response ───
   const isDev = process.env.NODE_ENV !== 'production';
   res.status(err.statusCode || 500).json({
     ok: false,
-    error: 'Internal server error',
-    ...(isDev && { details: err.message }),
+    error: 'internal_server_error',
+    message: 'حدث خطأ داخلي في السيرفر',
+    ...(isDev && {
+      details: err.message,
+      stack: err.stack,
+    }),
   });
 });
 

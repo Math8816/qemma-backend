@@ -1,8 +1,8 @@
 // ═══════════════════════════════════════════════
 //  src/routes/stock.js
 //  المخزون — stock + inventory_log + product_units
-//  ✅ متوافق مع stockService.js و storeApi.js
-//  ✅ يدعم الوحدات المتعددة (product_id + unit_id)
+//  ✅ inventory_log = المصدر الوحيد
+//  ✅ كل التعديلات تمر بـ recordMovement
 // ═══════════════════════════════════════════════
 
 const express = require('express');
@@ -10,11 +10,12 @@ const pool = require('../db');
 const { queryAsUser } = require('../db-rls');
 const { optionalAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
+const { recordMovement } = require('../services/inventorySync');
 
 const router = express.Router();
 router.use(auditMiddleware);
 
-// ─── Helper: صف stock ───
+// ─── Helper: صف stock (قراءة فقط) ───
 async function getStockRow(user, tenantId, productId, unitId) {
   const result = await queryAsUser(
     user,
@@ -23,63 +24,6 @@ async function getStockRow(user, tenantId, productId, unitId) {
     [tenantId, productId, unitId]
   );
   return result.rows[0] || null;
-}
-
-// ─── Helper: تعديل stock + log ───
-async function adjustStock(user, opts) {
-  const {
-    tenantId, organizationId,
-    productId, productName, unitId,
-    changeAmount, entryType, reason,
-    referenceId, referenceNumber,
-    unitCost = 0, createdBy, createdByName, date,
-  } = opts;
-
-  const existing = await getStockRow(user, tenantId, productId, unitId);
-  let previousQty = 0;
-  let newQty = 0;
-
-  if (existing) {
-    previousQty = Number(existing.quantity) || 0;
-    newQty = previousQty + Number(changeAmount);
-    await queryAsUser(
-      user,
-      `UPDATE stock SET quantity = $1, updated_at = NOW() WHERE id = $2`,
-      [newQty, existing.id]
-    );
-  } else {
-    newQty = Number(changeAmount);
-    await queryAsUser(
-      user,
-      `INSERT INTO stock
-        (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
-       VALUES ($1, $2, $3, $4, $5, 0)`,
-      [tenantId, organizationId, productId, unitId, newQty]
-    );
-  }
-
-  // inventory_log
-  await queryAsUser(
-    user,
-    `INSERT INTO inventory_log
-      (tenant_id, organization_id, product_id, product_name, unit_id,
-       change_amount, previous_qty, new_qty, entry_type, reason,
-       reference_id, reference_number, unit_cost, total_value,
-       created_by, created_by_name, date)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-    [
-      tenantId, organizationId,
-      productId, productName || null, unitId,
-      changeAmount, previousQty, newQty,
-      entryType, reason || null,
-      referenceId || null, referenceNumber || null,
-      unitCost, Number(changeAmount) * unitCost,
-      createdBy || null, createdByName || null,
-      date || new Date().toISOString().split('T')[0],
-    ]
-  );
-
-  return { previousQty, newQty, changeAmount };
 }
 
 // ═══════════════════════════════════════════════
@@ -125,7 +69,6 @@ router.get('/rls/list', optionalAuth, async (req, res) => {
 
 // ═══════════════════════════════════════════════
 //  GET /api/stock/rls/detailed
-//  ✅ تجميع حسب المنتج مع كل وحداته
 // ═══════════════════════════════════════════════
 router.get('/rls/detailed', optionalAuth, async (req, res) => {
   try {
@@ -249,7 +192,6 @@ router.get('/rls/low-stock', optionalAuth, async (req, res) => {
 
 // ═══════════════════════════════════════════════
 //  GET /api/stock/rls/log
-//  ✅ يقبل "type" كـ alias لـ "entry_type"
 // ═══════════════════════════════════════════════
 router.get('/rls/log', optionalAuth, async (req, res) => {
   try {
@@ -375,16 +317,20 @@ router.post('/rls/verify-balance', optionalAuth, async (req, res) => {
 
 // ═══════════════════════════════════════════════
 //  POST /api/stock/rls/adjust
+//  ✅ تعديل يدوي — يستخدم recordMovement
 //  ✅ يقبل type أو entry_type
 // ═══════════════════════════════════════════════
 router.post('/rls/adjust', optionalAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
     const user = req.user;
     if (!user || !user.sub) {
+      client.release();
       return res.status(401).json({ ok: false, error: 'Authentication required' });
     }
     const tenantId = user.tenant_id;
     if (!tenantId) {
+      client.release();
       return res.status(400).json({ ok: false, error: 'tenant_id required' });
     }
 
@@ -402,25 +348,34 @@ router.post('/rls/adjust', optionalAuth, async (req, res) => {
     const finalEntryType = entry_type || type || 'adjustment';
 
     if (!product_id || !unit_id || change_amount === undefined) {
+      client.release();
       return res.status(400).json({
         ok: false,
         error: 'product_id, unit_id, change_amount are required',
       });
     }
 
-    const result = await adjustStock(user, {
+    await client.query('BEGIN');
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
+    await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
+
+    const result = await recordMovement(client, {
       tenantId,
-      organizationId: user.organization_id,
+      organizationId: user.organization_id || null,
       productId: product_id,
       productName: product_name,
       unitId: unit_id,
       changeAmount: Number(change_amount),
       entryType: finalEntryType,
-      reason,
+      reason: reason || 'تعديل يدوي',
       unitCost: Number(unit_cost) || 0,
       createdBy: user.sub,
       createdByName: user.email,
+      date: new Date().toISOString().split('T')[0],
+      allowNegative: true,  // ← التعديل اليدوي يسمح بالسالب
     });
+
+    await client.query('COMMIT');
 
     await req.audit({
       action: 'adjust',
@@ -431,30 +386,53 @@ router.post('/rls/adjust', optionalAuth, async (req, res) => {
 
     res.json({ ok: true, data: result });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('POST /stock/rls/adjust error:', err.message);
+
+    // ✅ Business errors
+    if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+      return res.status(err.statusCode).json({
+        ok: false,
+        error: err.code || 'business_error',
+        message: err.message,
+        ...(err.details && { details: err.details }),
+      });
+    }
+
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 
 // ═══════════════════════════════════════════════
 //  POST /api/stock/rls/apply-invoice
+//  ✅ يستخدم recordMovement
 // ═══════════════════════════════════════════════
 router.post('/rls/apply-invoice', optionalAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
     const user = req.user;
     if (!user || !user.sub) {
+      client.release();
       return res.status(401).json({ ok: false, error: 'Authentication required' });
     }
     const tenantId = user.tenant_id;
     if (!tenantId) {
+      client.release();
       return res.status(400).json({ ok: false, error: 'tenant_id required' });
     }
 
     const { invoiceId, invoiceNumber, invoiceType, items = [], date } = req.body;
 
     if (!['sale', 'purchase'].includes(invoiceType)) {
+      client.release();
       return res.status(400).json({ ok: false, error: 'invalid invoiceType' });
     }
+
+    await client.query('BEGIN');
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
+    await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
 
     const results = [];
     const errors = [];
@@ -462,9 +440,9 @@ router.post('/rls/apply-invoice', optionalAuth, async (req, res) => {
 
     for (const item of items) {
       try {
-        const r = await adjustStock(user, {
+        const r = await recordMovement(client, {
           tenantId,
-          organizationId: user.organization_id,
+          organizationId: user.organization_id || null,
           productId: item.product_id,
           productName: item.product_name,
           unitId: item.unit_id,
@@ -476,13 +454,15 @@ router.post('/rls/apply-invoice', optionalAuth, async (req, res) => {
           unitCost: Number(item.cost || item.price || 0),
           createdBy: user.sub,
           createdByName: user.email,
-          date,
+          date: date || new Date().toISOString().split('T')[0],
         });
         results.push({ product_id: item.product_id, ...r });
       } catch (e) {
         errors.push({ product_id: item.product_id, error: e.message });
       }
     }
+
+    await client.query('COMMIT');
 
     await req.audit({
       action: invoiceType === 'sale' ? 'sale-invoice' : 'purchase-invoice',
@@ -493,30 +473,42 @@ router.post('/rls/apply-invoice', optionalAuth, async (req, res) => {
 
     res.json({ ok: errors.length === 0, applied: results.length, errors, results });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('POST /stock/rls/apply-invoice error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 
 // ═══════════════════════════════════════════════
 //  POST /api/stock/rls/apply-return
+//  ✅ يستخدم recordMovement
 // ═══════════════════════════════════════════════
 router.post('/rls/apply-return', optionalAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
     const user = req.user;
     if (!user || !user.sub) {
+      client.release();
       return res.status(401).json({ ok: false, error: 'Authentication required' });
     }
     const tenantId = user.tenant_id;
     if (!tenantId) {
+      client.release();
       return res.status(400).json({ ok: false, error: 'tenant_id required' });
     }
 
     const { returnId, returnNumber, returnType, items = [], date } = req.body;
 
     if (!['sales_return', 'purchase_return'].includes(returnType)) {
+      client.release();
       return res.status(400).json({ ok: false, error: 'invalid returnType' });
     }
+
+    await client.query('BEGIN');
+    await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
+    await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
 
     const results = [];
     const errors = [];
@@ -524,9 +516,9 @@ router.post('/rls/apply-return', optionalAuth, async (req, res) => {
 
     for (const item of items) {
       try {
-        const r = await adjustStock(user, {
+        const r = await recordMovement(client, {
           tenantId,
-          organizationId: user.organization_id,
+          organizationId: user.organization_id || null,
           productId: item.product_id,
           productName: item.product_name,
           unitId: item.unit_id,
@@ -538,13 +530,16 @@ router.post('/rls/apply-return', optionalAuth, async (req, res) => {
           unitCost: Number(item.price || item.cost || 0),
           createdBy: user.sub,
           createdByName: user.email,
-          date,
+          date: date || new Date().toISOString().split('T')[0],
+          allowNegative: returnType === 'purchase_return',  // ⚠️ purchase_return قد يصبح سالباً
         });
         results.push({ product_id: item.product_id, ...r });
       } catch (e) {
         errors.push({ product_id: item.product_id, error: e.message });
       }
     }
+
+    await client.query('COMMIT');
 
     await req.audit({
       action: returnType,
@@ -555,8 +550,11 @@ router.post('/rls/apply-return', optionalAuth, async (req, res) => {
 
     res.json({ ok: errors.length === 0, applied: results.length, errors, results });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('POST /stock/rls/apply-return error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 

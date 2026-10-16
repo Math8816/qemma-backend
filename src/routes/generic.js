@@ -10,6 +10,7 @@ const pool = require('../db');
 const { queryAsUser } = require('../db-rls');
 const { optionalAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
+const { recordMovement } = require('../services/inventorySync');
 
 const router = express.Router();
 router.use(auditMiddleware);
@@ -383,6 +384,67 @@ router.post('/:table', optionalAuth, async (req, res) => {
       recordId: inserted[0]?.id,
       newData: inserted,
     });
+
+    // ⭐ Auto-sync: product_units → inventory_log + stock
+if (table === 'product_units') {
+  for (const row of inserted) {
+    const qty = Number(row.quantity) || 0;
+    if (qty <= 0) continue;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
+      if (row.tenant_id) {
+        await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [row.tenant_id]);
+      }
+
+      // 1️⃣ سجّل الحركة في inventory_log
+      await client.query(
+        `INSERT INTO inventory_log
+          (tenant_id, organization_id, product_id, unit_id,
+           change_amount, previous_qty, new_qty, entry_type, reason, date)
+         VALUES ($1, $2, $3, $4, $5, 0, $5, 'opening', 'رصيد افتتاحي', NOW()::date)`,
+        [
+          row.tenant_id,
+          row.organization_id || null,
+          row.product_id,
+          row.unit_id,
+          qty,
+        ]
+      );
+
+      // 2️⃣ أنشئ/حدّث stock
+      await client.query(
+        `INSERT INTO stock
+          (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (tenant_id, product_id, unit_id)
+         DO UPDATE SET
+           quantity = EXCLUDED.quantity,
+           min_quantity = EXCLUDED.min_quantity,
+           updated_at = NOW()`,
+        [
+          row.tenant_id,
+          row.organization_id || null,
+          row.product_id,
+          row.unit_id,
+          qty,
+          Number(row.min_quantity) || 0,
+        ]
+      );
+
+      await client.query('COMMIT');
+      console.log(`✅ Auto-sync product_unit → stock: ${row.product_id}`);
+    } catch (syncErr) {
+      await client.query('ROLLBACK');
+      console.error('⚠️ Auto-sync failed (non-fatal):', syncErr.message);
+      // لا نُفشل الطلب — product_units أُنشئ بنجاح
+    } finally {
+      client.release();
+    }
+  }
+}
 
     // ✅ إذا كان المُدخل كائنًا، أعِد كائنًا
     const responseData = Array.isArray(req.body) ? inserted : inserted[0];

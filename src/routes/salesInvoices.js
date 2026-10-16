@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════
 //  src/routes/salesInvoices.js
 //  فواتير المبيعات + الأصناف + Ledger + Stock
-//  ✅ كل العمليات في transaction واحدة
+//  ✅ inventory_log = المصدر الوحيد
 // ═══════════════════════════════════════════════
 
 const express = require('express');
@@ -9,6 +9,7 @@ const pool = require('../db');
 const { queryAsUser } = require('../db-rls');
 const { optionalAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
+const { recordMovement } = require('../services/inventorySync');
 const { idempotencyMiddleware } = require('../middleware/idempotency');
 
 const router = express.Router();
@@ -195,87 +196,31 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
       );
     }
 
-    // ─── 3. stock (خصم من المخزون) ───
-        for (const item of items) {
+    // ─── 3. تسجيل حركة المخزون ───
+    // ✅ inventory_log = المصدر الوحيد
+    // ✅ stock + product_units يُزامنان تلقائياً
+    for (const item of items) {
       if (!item.product_id || !item.unit_id) continue;
 
-      // احصل على الكمية الحالية
-      const stockRow = await client.query(
-        `SELECT id, quantity FROM stock
-         WHERE tenant_id = $1 AND product_id = $2 AND unit_id = $3`,
-        [tenantId, item.product_id, item.unit_id]
-      );
-
-      let prevQty = 0;
-      let newQty = 0;
-
-      if (stockRow.rows.length > 0) {
-        prevQty = Number(stockRow.rows[0].quantity) || 0;
-        newQty = prevQty - Number(item.quantity || 0);
-
-        // ⭐ جديد: منع السالب
-        if (newQty < 0) {
-          throw new Error(
-            `الكمية غير كافية للـ "${item.product_name}" — المتوفر: ${prevQty}, المطلوب: ${item.quantity}`
-          );
-        }
-
-        await client.query(
-          `UPDATE stock SET quantity = $1, updated_at = NOW() WHERE id = $2`,
-          [newQty, stockRow.rows[0].id]
-        );
-      } else {
-        newQty = -Number(item.quantity || 0);
-
-        if (newQty < 0) {
-          throw new Error(
-            `الكمية غير كافية للـ "${item.product_name}" — المتوفر: 0, المطلوب: ${item.quantity}`
-          );
-        }
-
-        await client.query(
-          `INSERT INTO stock (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
-           VALUES ($1, $2, $3, $4, $5, 0)`,
-          [tenantId, user.organization_id || null, item.product_id, item.unit_id, newQty]
-        );
-      }
-
-      // ⭐ جديد: مزامنة product_units.quantity (cache)
-      await client.query(
-        `UPDATE product_units
-         SET quantity = $1, updated_at = NOW()
-         WHERE product_id = $2 AND unit_id = $3 AND tenant_id = $4`,
-        [newQty, item.product_id, item.unit_id, tenantId]
-      );
-
-      // سجل الحركة
-      await client.query(
-        `INSERT INTO inventory_log
-          (tenant_id, organization_id, product_id, product_name, unit_id,
-           change_amount, previous_qty, new_qty, entry_type, reason,
-           reference_id, reference_number, unit_cost, total_value,
-           created_by, date)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sale','فاتورة مبيعات',$9,$10,$11,$12,$13,$14)`,
-        [
-          tenantId,
-          user.organization_id || null,
-          item.product_id,
-          item.product_name || null,
-          item.unit_id,
-          -Number(item.quantity || 0),
-          prevQty,
-          newQty,
-          invoiceId,
-          invoice_number,
-          Number(item.cost || 0),
-          -Number(item.quantity || 0) * Number(item.cost || 0),
-          user.sub,
-          date || new Date().toISOString().split('T')[0],
-        ]
-      );
+      await recordMovement(client, {
+        tenantId,
+        organizationId: user.organization_id || null,
+        productId: item.product_id,
+        productName: item.product_name,
+        unitId: item.unit_id,
+        changeAmount: -Number(item.quantity || 0),
+        entryType: 'sale',
+        reason: 'فاتورة مبيعات',
+        referenceId: invoiceId,
+        referenceNumber: invoice_number,
+        unitCost: Number(item.cost || 0),
+        createdBy: user.sub,
+        createdByName: user.email,
+        date: date || new Date().toISOString().split('T')[0],
+      });
     }
 
-        // ─── 4. Ledger (قيد مدين على العميل) ───
+    // ─── 4. Ledger (قيد مدين على العميل) ───
     if (customer_id && Number(total) > 0) {
       await client.query(
         `INSERT INTO ledger_entries
@@ -297,7 +242,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
       );
     }
 
-    // ─── 5. ⭐ جديد: Ledger (قيد payment إذا paid > 0) ───
+    // ─── 5. Ledger (قيد payment إذا paid > 0) ───
     if (customer_id && Number(paid) > 0) {
       await client.query(
         `INSERT INTO ledger_entries

@@ -3,6 +3,7 @@
 //  اتصال RLS-aware — لكل طلب
 // ═══════════════════════════════════════════════
 
+require('./db-config');
 const { Pool } = require('pg');
 
 const rlsPool = new Pool({

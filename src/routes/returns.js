@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════
 //  src/routes/returns.js
 //  المرتجعات + الأصناف — CRUD مع RLS
+//  ✅ inventory_log = المصدر الوحيد
 // ═══════════════════════════════════════════════
 
 const express = require('express');
@@ -9,12 +10,15 @@ const { queryAsUser } = require('../db-rls');
 const { optionalAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
 const { idempotencyMiddleware } = require('../middleware/idempotency');
+const { recordMovement } = require('../services/inventorySync');
 
 const router = express.Router();
 router.use(auditMiddleware);
 
 // ═══════════════════════════════════════════════════════════
 //  🧩 Helper: تطبيق مخزون المرتجع + Ledger (داخل transaction)
+//  ✅ inventory_log = المصدر الوحيد
+//  ✅ stock + product_units يُزامنان تلقائياً
 // ═══════════════════════════════════════════════════════════
 async function applyReturnEffects(client, user, {
   returnId,
@@ -30,76 +34,31 @@ async function applyReturnEffects(client, user, {
   const organizationId = user.organization_id || null;
   const finalDate = date || new Date().toISOString().split('T')[0];
   const isSalesReturn = returnType === 'sales_return';
-  const direction = isSalesReturn ? 1 : -1;   // sales: +1, purchase: -1
 
-  // ─── 1. stock + inventory_log + مزامنة cache ───
+  // ─── 1. حركة المخزون ───
+  // sales_return: + (يعود للمخزون)
+  // purchase_return: - (يعود للمورد)
   for (const item of items) {
     if (!item.product_id || !item.unit_id) continue;
 
-    const stockRow = await client.query(
-      `SELECT id, quantity FROM stock
-       WHERE tenant_id = $1 AND product_id = $2 AND unit_id = $3`,
-      [tenantId, item.product_id, item.unit_id]
-    );
-
-    let prevQty = 0;
-    let newQty = 0;
-
-    if (stockRow.rows.length > 0) {
-      prevQty = Number(stockRow.rows[0].quantity) || 0;
-      newQty = prevQty + direction * Number(item.quantity || 0);
-
-      if (newQty < 0) {
-        throw new Error(
-          `الكمية غير كافية للمرتجع "${item.product_name}" — المتوفر: ${prevQty}, المطلوب: ${item.quantity}`
-        );
-      }
-
-      await client.query(
-        `UPDATE stock SET quantity = $1, updated_at = NOW() WHERE id = $2`,
-        [newQty, stockRow.rows[0].id]
-      );
-    } else {
-      newQty = direction * Number(item.quantity || 0);
-      if (newQty < 0) {
-        throw new Error(`الكمية غير كافية للمرتجع "${item.product_name}"`);
-      }
-      await client.query(
-        `INSERT INTO stock (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
-         VALUES ($1, $2, $3, $4, $5, 0)`,
-        [tenantId, organizationId, item.product_id, item.unit_id, newQty]
-      );
-    }
-
-    // ⭐ مزامنة product_units.quantity
-    await client.query(
-      `UPDATE product_units
-       SET quantity = $1, updated_at = NOW()
-       WHERE product_id = $2 AND unit_id = $3 AND tenant_id = $4`,
-      [newQty, item.product_id, item.unit_id, tenantId]
-    );
-
-    // inventory_log
-    await client.query(
-      `INSERT INTO inventory_log
-        (tenant_id, organization_id, product_id, product_name, unit_id,
-         change_amount, previous_qty, new_qty, entry_type, reason,
-         reference_id, reference_number, unit_cost, total_value,
-         created_by, date)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-      [
-        tenantId, organizationId,
-        item.product_id, item.product_name || null, item.unit_id,
-        direction * Number(item.quantity || 0),
-        prevQty, newQty,
-        returnType,
-        isSalesReturn ? 'مرتجع مبيعات' : 'مرتجع مشتريات',
-        returnId, returnNumber,
-        Number(item.price || 0),
-        direction * Number(item.quantity || 0) * Number(item.price || 0),
-        user.sub, finalDate,
-      ]
-    );
+    await recordMovement(client, {
+      tenantId,
+      organizationId,
+      productId: item.product_id,
+      productName: item.product_name,
+      unitId: item.unit_id,
+      changeAmount: isSalesReturn
+        ? Math.abs(Number(item.quantity || 0))
+        : -Math.abs(Number(item.quantity || 0)),
+      entryType: returnType,
+      reason: isSalesReturn ? 'مرتجع مبيعات' : 'مرتجع مشتريات',
+      referenceId: returnId,
+      referenceNumber: returnNumber,
+      unitCost: Number(item.price || 0),
+      createdBy: user.sub,
+      createdByName: user.email,
+      date: finalDate,
+    });
   }
 
   // ─── 2. Ledger ───
@@ -338,7 +297,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
       newData: result.rows[0],
     });
 
-        res.status(201).json({ ok: true, data: result.rows[0] });
+    res.status(201).json({ ok: true, data: result.rows[0] });
   } catch (err) {
     console.error('POST /returns/rls error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
@@ -406,14 +365,12 @@ router.put('/rls/:id', optionalAuth, async (req, res) => {
 
     // 3. تحديث الأصناف (إذا مُرِّرت)
     if (items && Array.isArray(items)) {
-      // حذف القديم
       await queryAsUser(
         user,
         'DELETE FROM return_items WHERE return_id = $1',
         [req.params.id]
       );
 
-      // إدراج الجديد
       for (const item of items) {
         await queryAsUser(
           user,
@@ -456,6 +413,7 @@ router.put('/rls/:id', optionalAuth, async (req, res) => {
 //  PUT /api/returns/rls/:id/status
 //  ✅ Atomic: تحديث الحالة + stock + ledger في transaction واحدة
 //  ⭐ Idempotent: الاعتماد مرتين → لا تكرار
+//  ✅ inventory_log = المصدر الوحيد
 // ═══════════════════════════════════════════════════════════
 router.put('/rls/:id/status', optionalAuth, async (req, res) => {
   const client = await pool.connect();
@@ -529,43 +487,34 @@ router.put('/rls/:id/status', optionalAuth, async (req, res) => {
 
     // حالة 2: approved → rejected (إلغاء الأثر)
     if (previousStatus === 'approved' && status !== 'approved') {
-      // عكس المخزون (direction معاكس)
-      const reverseDirection = isSalesReturn ? -1 : 1;
-
+      // ─── عكس المخزون (direction معاكس) ───
       for (const item of items) {
         if (!item.product_id || !item.unit_id) continue;
 
-        const stockRow = await client.query(
-          `SELECT id, quantity FROM stock
-           WHERE tenant_id = $1 AND product_id = $2 AND unit_id = $3`,
-          [tenantId, item.product_id, item.unit_id]
-        );
-
-        if (stockRow.rows.length > 0) {
-          const prevQty = Number(stockRow.rows[0].quantity) || 0;
-          const newQty = prevQty + reverseDirection * Number(item.quantity || 0);
-
-          if (newQty < 0) {
-            throw new Error(
-              `الكمية غير كافية لعكس المرتجع "${item.product_name}"`
-            );
-          }
-
-          await client.query(
-            `UPDATE stock SET quantity = $1, updated_at = NOW() WHERE id = $2`,
-            [newQty, stockRow.rows[0].id]
-          );
-
-          await client.query(
-            `UPDATE product_units
-             SET quantity = $1, updated_at = NOW()
-             WHERE product_id = $2 AND unit_id = $3 AND tenant_id = $4`,
-            [newQty, item.product_id, item.unit_id, tenantId]
-          );
-        }
+        await recordMovement(client, {
+          tenantId,
+          organizationId: user.organization_id || null,
+          productId: item.product_id,
+          productName: item.product_name,
+          unitId: item.unit_id,
+          // عكس: sales_return كان +، الآن -
+          // عكس: purchase_return كان -، الآن +
+          changeAmount: isSalesReturn
+            ? -Math.abs(Number(item.quantity || 0))
+            : Math.abs(Number(item.quantity || 0)),
+          entryType: 'adjustment',
+          reason: `إلغاء اعتماد المرتجع ${returnData.return_number}`,
+          referenceId: returnData.id,
+          referenceNumber: `${returnData.return_number}-REVERSE`,
+          unitCost: Number(item.price || 0),
+          createdBy: user.sub,
+          createdByName: user.email,
+          date: new Date().toISOString().split('T')[0],
+          allowNegative: true,
+        });
       }
 
-      // عكس Ledger
+      // ─── عكس Ledger ───
       const accountId = isSalesReturn ? returnData.customer_id : returnData.supplier_id;
       if (accountId && Number(returnData.total) > 0) {
         const debit = isSalesReturn ? Number(returnData.total) : 0;
@@ -630,6 +579,17 @@ router.put('/rls/:id/status', optionalAuth, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('PUT /returns/rls/:id/status error:', err.message);
+
+    // ✅ إذا كان خطأ business → 409
+    if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+      return res.status(err.statusCode).json({
+        ok: false,
+        error: err.code || 'business_error',
+        message: err.message,
+        ...(err.details && { details: err.details }),
+      });
+    }
+
     res.status(500).json({ ok: false, error: err.message });
   } finally {
     client.release();

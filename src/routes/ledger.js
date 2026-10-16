@@ -1,9 +1,7 @@
 // ═══════════════════════════════════════════════
 //  src/routes/ledger.js
 //  دفتر الأستاذ — Ledger API
-//  ✅ يتوافق مع RLS Policy الموجودة
-//  ✅ يُدرج قيود + يُحدّث cache الأرصدة
-//  ✅ يدعم: void-invoice, expense, accounts, delete
+//  ✅ inventory_log = المصدر الوحيد (void-invoice)
 // ═══════════════════════════════════════════════
 
 const express = require('express');
@@ -12,6 +10,7 @@ const { queryAsUser } = require('../db-rls');
 const { optionalAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
 const { idempotencyMiddleware } = require('../middleware/idempotency');
+const { recordMovement } = require('../services/inventorySync');
 
 const router = express.Router();
 router.use(auditMiddleware);
@@ -182,7 +181,6 @@ router.get('/rls/list', optionalAuth, async (req, res) => {
 
 // ═══════════════════════════════════════════════
 //  GET /api/ledger/rls/accounts
-//  ✅ customers + suppliers مع الرصيد الفعلي المحسوب
 // ═══════════════════════════════════════════════
 router.get('/rls/accounts', optionalAuth, async (req, res) => {
   try {
@@ -313,9 +311,6 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'tenant_id required' });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  1️⃣ حساب الرصيد الافتتاحي (قبل start_date)
-    // ═══════════════════════════════════════════════════════════
     let openingBalance = 0;
 
     if (start_date) {
@@ -336,7 +331,6 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       const totalDebit = Number(row.total_debit) || 0;
       const totalCredit = Number(row.total_credit) || 0;
 
-      // نفس sign convention
       if (accountType === 'customer') {
         openingBalance = totalDebit - totalCredit;
       } else if (accountType === 'supplier') {
@@ -346,9 +340,6 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  2️⃣ جلب الحركات داخل الفترة
-    // ═══════════════════════════════════════════════════════════
     let whereClause = 'WHERE tenant_id = $1 AND account_id = $2 AND account_type = $3';
     const params = [tenantId, req.params.accountId, accountType];
 
@@ -370,10 +361,7 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       params
     );
 
-    // ═══════════════════════════════════════════════════════════
-    //  3️⃣ بناء الكشف مع running_balance صحيح
-    // ═══════════════════════════════════════════════════════════
-    let runningBalance = openingBalance;   // ⭐ ابدأ من الرصيد الافتتاحي
+    let runningBalance = openingBalance;
 
     const statement = result.rows.map((entry) => {
       const debit = Number(entry.debit) || 0;
@@ -390,9 +378,6 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       return { ...entry, running_balance: runningBalance };
     });
 
-    // ═══════════════════════════════════════════════════════════
-    //  4️⃣ إضافة صف "رصيد افتتاحي" في البداية (إن وُجد)
-    // ═══════════════════════════════════════════════════════════
     if (start_date && openingBalance !== 0) {
       statement.unshift({
         id: '__opening__',
@@ -402,13 +387,10 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
         debit: accountType === 'customer' && openingBalance > 0 ? openingBalance : 0,
         credit: accountType === 'customer' && openingBalance < 0 ? Math.abs(openingBalance) : 0,
         running_balance: openingBalance,
-        is_opening: true,   // ⭐ علم للفرونت
+        is_opening: true,
       });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  5️⃣ حساب الملخص
-    // ═══════════════════════════════════════════════════════════
     const summary = result.rows.reduce(
       (acc, e) => {
         acc.total_debit += Number(e.debit) || 0;
@@ -418,17 +400,17 @@ router.get('/rls/statement/:accountId', optionalAuth, async (req, res) => {
       { total_debit: 0, total_credit: 0 }
     );
 
-    summary.opening_balance = openingBalance;   // ⭐ جديد
-    summary.closing_balance = runningBalance;    // الرصيد النهائي
-    summary.balance = runningBalance;            // للتوافق مع الكود القديم
+    summary.opening_balance = openingBalance;
+    summary.closing_balance = runningBalance;
+    summary.balance = runningBalance;
     summary.entries_count = statement.length;
 
     res.json({
       ok: true,
       accountId: req.params.accountId,
       accountType,
-      opening_balance: openingBalance,   // ⭐ للفرونت مباشرة
-      closing_balance: runningBalance,   // ⭐ للفرونت مباشرة
+      opening_balance: openingBalance,
+      closing_balance: runningBalance,
       statement,
       summary,
     });
@@ -558,7 +540,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════
-//  POST /api/ledger/rls/record-invoice — قيد فاتورة
+//  POST /api/ledger/rls/record-invoice
 // ═══════════════════════════════════════════════
 router.post('/rls/record-invoice', optionalAuth, async (req, res) => {
   try {
@@ -684,9 +666,6 @@ router.post('/rls/record-payment', optionalAuth, async (req, res) => {
 
     const isCustomer = accountType === 'customer';
 
-    // ═══════════════════════════════════════════════════════════
-    //  🔐 Transaction: قيد + تحديث الفاتورة + cache
-    // ═══════════════════════════════════════════════════════════
     await client.query('BEGIN');
     await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
     await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
@@ -720,13 +699,12 @@ router.post('/rls/record-payment', optionalAuth, async (req, res) => {
     );
     const entry = entryRes.rows[0];
 
-    // ─── 2. تحديث الفاتورة (إن وُجد رقم) ───
+    // ─── 2. تحديث الفاتورة ───
     let invoiceUpdate = null;
 
     if (invoiceNumber) {
       const table = isCustomer ? 'sales_invoices' : 'purchase_invoices';
 
-      // جلب الفاتورة الحالية
       const invRes = await client.query(
         `SELECT id, paid, total, remaining
          FROM ${table}
@@ -763,7 +741,6 @@ router.post('/rls/record-payment', optionalAuth, async (req, res) => {
     // ─── 3. تحديث cache الرصيد ───
     await refreshBalanceCache(client, user, tenantId, accountId, accountType);
 
-    // ─── 4. جلب الرصيد الجديد ───
     const balanceRes = await client.query(
       `SELECT balance FROM ${isCustomer ? 'customers' : 'suppliers'}
        WHERE id = $1 AND tenant_id = $2`,
@@ -875,6 +852,7 @@ router.post('/rls/record-return', optionalAuth, async (req, res) => {
 // ═══════════════════════════════════════════════
 //  POST /api/ledger/rls/void-invoice
 //  ✅ إلغاء فاتورة (قيد عكسي + إرجاع مخزون + تحديث حالة)
+//  ✅ inventory_log = المصدر الوحيد
 // ═══════════════════════════════════════════════
 router.post('/rls/void-invoice', optionalAuth, async (req, res) => {
   const client = await pool.connect();
@@ -960,61 +938,28 @@ router.post('/rls/void-invoice', optionalAuth, async (req, res) => {
       ]
     );
 
-    // 4. إرجاع المخزون
+    // 4. إرجاع المخزون (void = إرجاع)
+    // ✅ inventory_log = المصدر الوحيد
+    // ✅ stock + product_units يُزامنان تلقائياً
     for (const item of itemsRes.rows) {
       if (!item.product_id || !item.unit_id) continue;
 
-      const stockRes = await client.query(
-        `SELECT id, quantity FROM stock
-         WHERE tenant_id = $1 AND product_id = $2 AND unit_id = $3`,
-        [tenantId, item.product_id, item.unit_id]
-      );
-
-      let prevQty = 0;
-      let newQty = 0;
-
-      if (stockRes.rows.length > 0) {
-        prevQty = Number(stockRes.rows[0].quantity) || 0;
-        newQty = prevQty + Number(item.quantity);
-        await client.query(
-          `UPDATE stock SET quantity = $1, updated_at = NOW() WHERE id = $2`,
-          [newQty, stockRes.rows[0].id]
-        );
-      } else {
-        newQty = Number(item.quantity);
-        await client.query(
-          `INSERT INTO stock
-            (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
-           VALUES ($1, $2, $3, $4, $5, 0)`,
-          [tenantId, user.organization_id || null, item.product_id, item.unit_id, newQty]
-        );
-      }
-
-      await client.query(
-        `INSERT INTO inventory_log
-          (tenant_id, organization_id, product_id, product_name, unit_id,
-           change_amount, previous_qty, new_qty, entry_type, reason,
-           reference_id, reference_number, unit_cost, total_value,
-           created_by, date)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'void_sale',$9,$10,$11,$12,$13,$14,$15)`,
-        [
-          tenantId,
-          user.organization_id || null,
-          item.product_id,
-          item.product_name || null,
-          item.unit_id,
-          Number(item.quantity),
-          prevQty,
-          newQty,
-          `إلغاء فاتورة ${invoiceNumber}`,
-          invoiceId,
-          invoiceNumber,
-          Number(item.price || 0),
-          Number(item.quantity) * Number(item.price || 0),
-          user.sub,
-          finalDate,
-        ]
-      );
+      await recordMovement(client, {
+        tenantId,
+        organizationId: user.organization_id || null,
+        productId: item.product_id,
+        productName: item.product_name,
+        unitId: item.unit_id,
+        changeAmount: Math.abs(Number(item.quantity || 0)),  // ← إرجاع
+        entryType: 'void_sale',
+        reason: `إلغاء فاتورة ${invoiceNumber} — ${reason}`,
+        referenceId: invoiceId,
+        referenceNumber: invoiceNumber,
+        unitCost: Number(item.price || 0),
+        createdBy: user.sub,
+        createdByName: user.email,
+        date: finalDate,
+      });
     }
 
     // 5. تحديث حالة الفاتورة
@@ -1044,6 +989,17 @@ router.post('/rls/void-invoice', optionalAuth, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('POST /ledger/rls/void-invoice error:', err.message);
+
+    // ✅ Business errors
+    if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+      return res.status(err.statusCode).json({
+        ok: false,
+        error: err.code || 'business_error',
+        message: err.message,
+        ...(err.details && { details: err.details }),
+      });
+    }
+
     res.status(500).json({ ok: false, error: err.message });
   } finally {
     client.release();
@@ -1170,7 +1126,7 @@ router.delete('/rls/:id', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════
-//  POST /api/ledger/rls/recalc-all — إعادة حساب كل الأرصدة
+//  POST /api/ledger/rls/recalc-all
 // ═══════════════════════════════════════════════
 router.post('/rls/recalc-all', optionalAuth, async (req, res) => {
   try {

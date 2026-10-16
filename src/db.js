@@ -3,6 +3,7 @@
 //  اتصال قاعدة البيانات — PostgreSQL Pool
 // ═══════════════════════════════════════════════
 
+require('./db-config');
 const { Pool } = require('pg');
 
 const pool = new Pool({
