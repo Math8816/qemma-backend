@@ -1,33 +1,7 @@
 // ═══════════════════════════════════════════════════════════
 //  src/services/inventorySync.js
-//  🎯 المصدر الوحيد للحقيقة: inventory_log
-//  ✅ كل حركة مخزون تمر من هنا
-//  ✅ stock + product_units يُزامنان تلقائياً
 // ═══════════════════════════════════════════════════════════
 
-/**
- * 🎯 تسجيل حركة مخزون + مزامنة stock + product_units
- *
- * @param {object} client - DB client (داخل transaction)
- * @param {object} params
- * @param {string} params.tenantId
- * @param {string} params.organizationId
- * @param {string} params.productId
- * @param {string} params.productName
- * @param {string} params.unitId
- * @param {number} params.changeAmount - موجب = إضافة، سالب = خصم
- * @param {string} params.entryType - sale | purchase | return | adjustment | void_sale
- * @param {string} params.reason
- * @param {string} [params.referenceId]
- * @param {string} [params.referenceNumber]
- * @param {number} [params.unitCost=0]
- * @param {string} [params.createdBy]
- * @param {string} [params.createdByName]
- * @param {string} [params.date]
- * @param {boolean} [params.allowNegative=false] - للسماح بالسالب (غير مستخدم حالياً)
- *
- * @returns {Promise<{ previousQty: number, newQty: number, changeAmount: number }>}
- */
 async function recordMovement(client, params) {
   const {
     tenantId,
@@ -47,9 +21,17 @@ async function recordMovement(client, params) {
     allowNegative = false,
   } = params;
 
-  // ═══════════════════════════════════════════════════════════
-  //  1️⃣ احسب الرصيد الحقيقي من inventory_log (المصدر الوحيد)
-  // ═══════════════════════════════════════════════════════════
+  // ═══ شبكة أمان: جلب unitName تلقائياً إن لم يُمرر ═══
+  let unitName = params.unitName || null;
+  if (!unitName && unitId) {
+    const uRes = await client.query(
+      `SELECT name FROM units WHERE id = $1`,
+      [unitId]
+    );
+    unitName = uRes.rows[0]?.name || null;
+  }
+
+  // 1️⃣ احسب الرصيد الحقيقي من inventory_log (المصدر الوحيد)
   const balanceRes = await client.query(
     `SELECT COALESCE(SUM(change_amount), 0)::numeric AS balance
      FROM inventory_log
@@ -62,9 +44,7 @@ async function recordMovement(client, params) {
   const previousQty = Number(balanceRes.rows[0]?.balance) || 0;
   const newQty = previousQty + Number(changeAmount);
 
-  // ═══════════════════════════════════════════════════════════
-  //  2️⃣ منع الرصيد السالب (لحركات البيع فقط)
-  // ═══════════════════════════════════════════════════════════
+  // 2️⃣ منع الرصيد السالب (لحركات البيع فقط)
   if (newQty < 0 && entryType === 'sale' && !allowNegative) {
     const err = new Error(
       `الكمية غير كافية للـ "${productName}" — المتوفر: ${previousQty}, المطلوب: ${Math.abs(changeAmount)}`
@@ -80,22 +60,21 @@ async function recordMovement(client, params) {
     throw err;
   }
 
-  // ═══════════════════════════════════════════════════════════
-  //  3️⃣ سجّل الحركة في inventory_log (المصدر الوحيد)
-  // ═══════════════════════════════════════════════════════════
+  // 3️⃣ سجّل الحركة في inventory_log (المصدر الوحيد)
   await client.query(
     `INSERT INTO inventory_log
-      (tenant_id, organization_id, product_id, product_name, unit_id,
+      (tenant_id, organization_id, product_id, product_name, unit_id, unit_name,
        change_amount, previous_qty, new_qty, entry_type, reason,
        reference_id, reference_number, unit_cost, total_value,
        created_by, created_by_name, date)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
     [
       tenantId,
       organizationId,
       productId,
       productName,
       unitId,
+      unitName,
       Number(changeAmount),
       previousQty,
       newQty,
@@ -111,9 +90,7 @@ async function recordMovement(client, params) {
     ]
   );
 
-  // ═══════════════════════════════════════════════════════════
-  //  4️⃣ Sync stock (cache) — INSERT ... ON CONFLICT
-  // ═══════════════════════════════════════════════════════════
+  // 4️⃣ Sync stock (cache)
   await client.query(
     `INSERT INTO stock
       (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
@@ -125,9 +102,7 @@ async function recordMovement(client, params) {
     [tenantId, organizationId, productId, unitId, newQty]
   );
 
-  // ═══════════════════════════════════════════════════════════
-  //  5️⃣ Sync product_units (cache)
-  // ═══════════════════════════════════════════════════════════
+  // 5️⃣ Sync product_units (cache)
   await client.query(
     `UPDATE product_units
      SET quantity = $1, updated_at = NOW()
@@ -137,9 +112,6 @@ async function recordMovement(client, params) {
     [newQty, tenantId, productId, unitId]
   );
 
-  // ═══════════════════════════════════════════════════════════
-  //  ✅ إرجاع الملخص
-  // ═══════════════════════════════════════════════════════════
   return {
     previousQty,
     newQty,
@@ -147,9 +119,6 @@ async function recordMovement(client, params) {
   };
 }
 
-// ═══════════════════════════════════════════════════════════
-//  📤 التصدير
-// ═══════════════════════════════════════════════════════════
 module.exports = {
   recordMovement,
 };

@@ -134,6 +134,13 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'items are required' });
     }
 
+    // جلب اسم الموظف
+  const empRes = await pool.query(
+    `SELECT full_name FROM users WHERE id = $1`,
+    [user.sub]
+  );
+  const employeeName = empRes.rows[0]?.full_name || user.email || null;
+
     // ═══════════════════════════════════════════════════════
     //  🔐 session vars لتفعيل RLS
     // ═══════════════════════════════════════════════════════
@@ -147,10 +154,10 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
     const invResult = await client.query(
       `INSERT INTO sales_invoices
         (invoice_number, customer_id, customer_name, customer_phone,
-         sales_rep_id, price_type, previous_balance,
+         sales_rep_id,employee_id, employee_name, price_type, previous_balance,
          subtotal, discount, tax, total, paid, remaining,
          date, notes, tenant_id, organization_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
        RETURNING *`,
       [
         invoice_number,
@@ -158,6 +165,8 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
         customer_name || null,
         customer_phone || null,
         sales_rep_id || null,
+        user.sub,
+        employeeName,
         price_type || 'retail',
         Number(previous_balance) || 0,
         Number(subtotal) || 0,
@@ -177,11 +186,17 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
 
     // ─── 2. sales_invoice_items ───
     for (const item of items) {
+      // جلب اسم الوحدة إن لم يُمرر
+      let uName = item.unit_name;
+      if (!uName && item.unit_id) {
+        const uRes = await client.query(`SELECT name FROM units WHERE id = $1`, [item.unit_id]);
+        uName = uRes.rows[0]?.name || null;
+      }
       await client.query(
         `INSERT INTO sales_invoice_items
           (invoice_id, product_id, product_name, quantity, price, total,
-           unit_id, tenant_id, organization_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+           unit_id, unit_name, tenant_id, organization_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
         [
           invoiceId,
           item.product_id || null,
@@ -190,6 +205,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
           Number(item.price) || 0,
           Number(item.quantity || 0) * Number(item.price || 0),
           item.unit_id || null,
+          uName,
           tenantId,
           user.organization_id || null,
         ]

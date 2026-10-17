@@ -171,11 +171,17 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
 
     // ─── 2. items ───
     for (const item of items) {
+      // جلب اسم الوحدة إن لم يُمرر
+      let uName = item.unit_name;
+      if (!uName && item.unit_id) {
+        const uRes = await client.query(`SELECT name FROM units WHERE id = $1`, [item.unit_id]);
+        uName = uRes.rows[0]?.name || null;
+      }
       await client.query(
         `INSERT INTO purchase_invoice_items
           (invoice_id, product_id, product_name, quantity, cost, total,
-           unit_id, tenant_id, organization_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+           unit_id, unit_name, tenant_id, organization_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
         [
           invoiceId,
           item.product_id || null,
@@ -184,6 +190,7 @@ router.post('/rls', optionalAuth, idempotencyMiddleware, async (req, res) => {
           Number(item.cost || item.price || 0),
           Number(item.quantity || 0) * Number(item.cost || item.price || 0),
           item.unit_id || null,
+          uName,
           tenantId,
           user.organization_id || null,
         ]

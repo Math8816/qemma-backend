@@ -399,22 +399,40 @@ if (table === 'product_units') {
         await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [row.tenant_id]);
       }
 
-      // 1️⃣ سجّل الحركة في inventory_log
+      // 1️⃣ جلب اسم المنتج
+      const pRes = await client.query(
+        `SELECT name FROM products WHERE id = $1`,
+        [row.product_id]
+      );
+      const productName = pRes.rows[0]?.name || null;
+
+      // 2️⃣ جلب اسم الوحدة
+      const uRes = await client.query(
+        `SELECT name FROM units WHERE id = $1`,
+        [row.unit_id]
+      );
+      const unitName = uRes.rows[0]?.name || null;
+
+      // 3️⃣ سجّل الحركة في inventory_log
       await client.query(
         `INSERT INTO inventory_log
-          (tenant_id, organization_id, product_id, unit_id,
-           change_amount, previous_qty, new_qty, entry_type, reason, date)
-         VALUES ($1, $2, $3, $4, $5, 0, $5, 'opening', 'رصيد افتتاحي', NOW()::date)`,
+          (tenant_id, organization_id, product_id, product_name, unit_id, unit_name,
+           change_amount, previous_qty, new_qty, entry_type, reason, date, created_by, created_by_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $7, 'opening', 'رصيد افتتاحي', NOW()::date, $8, $9)`,
         [
           row.tenant_id,
           row.organization_id || null,
           row.product_id,
+          productName,
           row.unit_id,
+          unitName,
           qty,
+          user.sub,
+          user.email,
         ]
       );
 
-      // 2️⃣ أنشئ/حدّث stock
+      // 4️⃣ أنشئ/حدّث stock
       await client.query(
         `INSERT INTO stock
           (tenant_id, organization_id, product_id, unit_id, quantity, min_quantity)
@@ -439,7 +457,6 @@ if (table === 'product_units') {
     } catch (syncErr) {
       await client.query('ROLLBACK');
       console.error('⚠️ Auto-sync failed (non-fatal):', syncErr.message);
-      // لا نُفشل الطلب — product_units أُنشئ بنجاح
     } finally {
       client.release();
     }

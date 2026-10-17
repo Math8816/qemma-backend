@@ -46,6 +46,7 @@ router.get('/rls/list', optionalAuth, async (req, res) => {
          p.name          AS product_name,
          p.name          AS name,
          u.name          AS unit_name,
+         p.category_id   AS category_id,
          u.symbol        AS unit_symbol,
          COALESCE(pu.cost, 0)             AS cost,
          COALESCE(pu.retail_price, 0)     AS retail_price,
@@ -359,11 +360,18 @@ router.post('/rls/adjust', optionalAuth, async (req, res) => {
     await client.query(`SELECT set_config('app.user_id', $1, true)`, [user.sub]);
     await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenantId]);
 
+    // قبل الاستدعاء
+   let finalProductName = product_name;
+   if (!finalProductName && product_id) {
+     const pr = await client.query(`SELECT name FROM products WHERE id = $1`, [product_id]);
+     finalProductName = pr.rows[0]?.name || null;
+   }
+
     const result = await recordMovement(client, {
       tenantId,
       organizationId: user.organization_id || null,
       productId: product_id,
-      productName: product_name,
+      productName: finalProductName,
       unitId: unit_id,
       changeAmount: Number(change_amount),
       entryType: finalEntryType,
