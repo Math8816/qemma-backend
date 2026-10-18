@@ -47,6 +47,8 @@ const ALLOWED_TABLES = [
   'loyalty_transactions',
   'loyalty_points',
   'loyalty_tiers',
+  'employee_achievements',
+  'employee_activity',
   'expense_entries',
   'operating_expenses',
   'operating_expense_categories',
