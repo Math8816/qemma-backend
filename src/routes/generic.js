@@ -51,6 +51,7 @@ const ALLOWED_TABLES = [
   'employee_activity',
   'expense_entries',
   'operating_expenses',
+  'operating_expense_entries',
   'operating_expense_categories',
 
   // ─── مخزون ───
