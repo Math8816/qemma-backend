@@ -16,6 +16,7 @@ const TENANT_TABLES = [
   'returns', 'return_items', 'transactions', 'operating_expenses',
   'operating_expense_entries', 'loyalty_points', 'loyalty_transactions',
   'employee_achievements', 'employee_activity', 'settings', 'notifications',
+  'audit_log', 'idempotency_keys', 'trial_signups', 'password_resets', 'email_verifications',
 ];
 
 const ORG_SCOPED_TABLES = ['branches'];
