@@ -4,9 +4,8 @@
 // ═══════════════════════════════════════════════
 
 const express = require('express');
-const pool = require('../db');
 const { queryAsUser } = require('../db-rls');
-const { optionalAuth, requireAuth } = require('../middleware/auth');
+const { optionalAuth } = require('../middleware/auth');
 const { auditMiddleware } = require('../middleware/audit');
 
 const router = express.Router();
@@ -15,24 +14,8 @@ const router = express.Router();
 router.use(auditMiddleware);
 
 // ═══════════════════════════════════════════════
-//  GET /api/products — كل المنتجات (بدون RLS) — للاختبار
-// ═══════════════════════════════════════════════
-router.get('/', async (_req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, name, category_id, company_id, tenant_id, organization_id, created_at
-       FROM products ORDER BY name LIMIT 100`
-    );
-    res.json({ ok: true, count: rows.length, data: rows });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════
 //  GET /api/products/rls/list — قائمة كاملة (مع RLS + Joins)
 //  ✅ يجلب: التصنيف + الشركة + الوحدات + الأسعار
-//  ⚠️ يجب أن يكون قبل /:id
 // ═══════════════════════════════════════════════
 router.get('/rls/list', optionalAuth, async (req, res) => {
   try {
@@ -175,62 +158,6 @@ router.get('/rls/:id', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════
-//  GET /api/products/:id — منتج واحد (بدون RLS)
-//  ⚠️ يجب أن يكون بعد /rls/list و /rls/:id
-// ═══════════════════════════════════════════════
-router.get('/:id', async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      'SELECT * FROM products WHERE id = $1',
-      [req.params.id]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ ok: false, error: 'Product not found' });
-    }
-
-    res.json({ ok: true, data: rows[0] });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════
-//  POST /api/products — إنشاء منتج (بدون RLS)
-// ═══════════════════════════════════════════════
-router.post('/', async (req, res) => {
-  try {
-    const { name, category_id, company_id, tenant_id, organization_id } = req.body;
-
-    if (!name || name.trim() === '') {
-      return res.status(400).json({ ok: false, error: 'name is required' });
-    }
-    if (!tenant_id) {
-      return res.status(400).json({ ok: false, error: 'tenant_id is required' });
-    }
-
-    const { rows } = await pool.query(
-      `INSERT INTO products (name, category_id, company_id, tenant_id, organization_id)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [name.trim(), category_id || null, company_id || null, tenant_id, organization_id || null]
-    );
-
-    await req.audit({
-      action: 'create',
-      tableName: 'products',
-      recordId: rows[0].id,
-      newData: rows[0],
-    });
-
-    res.status(201).json({ ok: true, data: rows[0] });
-  } catch (err) {
-    console.error('POST /products error:', err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════
 //  POST /api/products/rls — إنشاء منتج (مع RLS)
 // ═══════════════════════════════════════════════
 router.post('/rls', optionalAuth, async (req, res) => {
@@ -271,49 +198,6 @@ router.post('/rls', optionalAuth, async (req, res) => {
     res.status(201).json({ ok: true, data: result.rows[0] });
   } catch (err) {
     console.error('POST /products/rls error:', err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════
-//  PUT /api/products/:id — تحديث منتج (بدون RLS)
-// ═══════════════════════════════════════════════
-router.put('/:id', async (req, res) => {
-  try {
-    const { name, category_id, company_id } = req.body;
-
-    if (!name || name.trim() === '') {
-      return res.status(400).json({ ok: false, error: 'name is required' });
-    }
-
-    const { rows: oldRows } = await pool.query(
-      'SELECT * FROM products WHERE id = $1',
-      [req.params.id]
-    );
-
-    const { rows } = await pool.query(
-      `UPDATE products
-       SET name = $1, category_id = $2, company_id = $3, updated_at = NOW()
-       WHERE id = $4
-       RETURNING *`,
-      [name.trim(), category_id || null, company_id || null, req.params.id]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ ok: false, error: 'Product not found' });
-    }
-
-    await req.audit({
-      action: 'update',
-      tableName: 'products',
-      recordId: rows[0].id,
-      oldData: oldRows[0] || null,
-      newData: rows[0],
-    });
-
-    res.json({ ok: true, data: rows[0] });
-  } catch (err) {
-    console.error('PUT /products error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -364,34 +248,6 @@ router.put('/rls/:id', optionalAuth, async (req, res) => {
     res.json({ ok: true, data: result.rows[0] });
   } catch (err) {
     console.error('PUT /products/rls error:', err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════
-//  DELETE /api/products/:id — حذف منتج (بدون RLS)
-// ═══════════════════════════════════════════════
-router.delete('/:id', async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      'DELETE FROM products WHERE id = $1 RETURNING *',
-      [req.params.id]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ ok: false, error: 'Product not found' });
-    }
-
-    await req.audit({
-      action: 'delete',
-      tableName: 'products',
-      recordId: rows[0].id,
-      oldData: rows[0],
-    });
-
-    res.json({ ok: true, deleted: rows[0] });
-  } catch (err) {
-    console.error('DELETE /products error:', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
